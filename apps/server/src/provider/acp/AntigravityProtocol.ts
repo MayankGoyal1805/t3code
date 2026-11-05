@@ -406,6 +406,9 @@ const ANTIGRAVITY_SUBAGENT_TITLES = new Set([
   "Run invoke_subagent?",
 ]);
 
+export const isAntigravitySubagentTitle = (title: string | null | undefined) =>
+  title !== undefined && title !== null && ANTIGRAVITY_SUBAGENT_TITLES.has(title);
+
 /** The ACP agent reports subagent calls as ordinary tools without child IDs or models. */
 export function classifyAntigravitySubagentToolCall(
   toolCall: AcpToolCallState,

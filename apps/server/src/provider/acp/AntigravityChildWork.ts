@@ -113,7 +113,7 @@ const toolCallOf = (payload: Uint8Array) =>
 
 // Tool step {5: metadata{4: call{1 id, 2 name}}, 140: {2: result{6: Any InvokeSubagent{1: specs
 // {1 type, 2 role, 3 prompt, 12 model}, 2: children{1 conversation id}}}}}.
-const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
+export const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
   const toolCallId = text(toolCallOf(payload), 1);
   const any = message(
     message(message(payload, STEP_TOOL_RESULT), TOOL_RESULT_PAYLOAD),

@@ -70,7 +70,7 @@ class AntigravitySessionLogError extends Schema.TaggedError<AntigravitySessionLo
 
 const sessionLogError = (cause: unknown) => new AntigravitySessionLogError({ cause });
 
-const readSteps = <A>(file: string, read: (database: NodeSqlite.DatabaseSync) => A) =>
+export const readSteps = <A>(file: string, read: (database: NodeSqlite.DatabaseSync) => A) =>
   Effect.try({
     try: () => {
       const database = new NodeSqlite.DatabaseSync(file, { readOnly: true });

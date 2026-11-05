@@ -146,6 +146,20 @@ const messageStep = (body: string) =>
     ),
   );
 
+/** The parent's inbound step when a child reports back: 114{1: rendered, 4: {3 sender, 4 content}}. */
+export const wakeMessageStep = (sender: string, content: string) =>
+  step(
+    101,
+    proto(),
+    field(
+      114,
+      proto(
+        field(1, `[Message] timestamp=2026-11-05T18:45:22Z sender=${sender} content=${content}`),
+        field(4, proto(field(3, sender), field(4, content))),
+      ),
+    ),
+  );
+
 export const errorStep = (input: {
   readonly title: string;
   readonly detail: string;

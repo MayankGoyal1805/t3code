@@ -28,6 +28,16 @@ import * as EffectAcpErrors from "effect-acp/errors";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import {
+  CALL_ID,
+  CHILD,
+  LAUNCH,
+  invokeStep,
+  plannerStep,
+  wakeMessageStep,
+  writeConversation,
+} from "../../provider/acp/AntigravityChildWork.testkit.ts";
+import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "../../provider/acp/AntigravityChildWork.ts";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
@@ -520,6 +530,187 @@ describe("AntigravityAdapterV2 html_render pages", () => {
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, report), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, failed), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, errored), undefined);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});
+
+describe("AntigravityAdapterV2 subagent wake", () => {
+  // agy 1.5.1 sends nothing over ACP after the launch turn's end_turn; the follow-up is only in its log.
+  const launchInput = {
+    Model: LAUNCH.model,
+    Prompt: LAUNCH.prompt,
+    Role: LAUNCH.role,
+    TypeName: "research",
+  };
+  const launchFrame = {
+    toolCallId: CALL_ID,
+    title: "Run invoke_subagent",
+    kind: "other",
+    rawInput: launchInput,
+  } as const;
+
+  // The mock agent is a subprocess, and the adapter finalizes after a wall-clock debounce.
+  it.live("keeps the turn open for the parent's follow-up and completes the subagent with it", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* SecureRandom.SecureRandom;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const profileDirectory = yield* fileSystem.makeTempDirectoryScoped();
+      const conversations = path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS);
+      yield* fileSystem.makeDirectory(conversations, { recursive: true });
+      const answer = "README.md has 1 line.";
+      writeConversation(path.join(conversations, "mock-session-1.db"), [
+        { type: 14, payload: new Uint8Array(), metadata: new Uint8Array() },
+        plannerStep({ calls: [{ id: CALL_ID, name: "invoke_subagent", args: "{}" }] }),
+        invokeStep({ callId: CALL_ID, launches: [LAUNCH], children: [CHILD] }),
+        plannerStep({ text: "I have launched a subagent." }),
+        wakeMessageStep(CHILD, answer),
+        plannerStep({ text: answer }),
+      ]);
+      let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      const instanceId = ProviderInstanceId.make("antigravity-wake-test");
+      const threadId = ThreadId.make("thread-antigravity-wake");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        profileDirectory,
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1" },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  sessionUpdate = handler;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+              prompt: () =>
+                Effect.gen(function* () {
+                  const send = (update: EffectAcpSchema.SessionUpdate) =>
+                    sessionUpdate === undefined
+                      ? Effect.die("the adapter must handle session updates")
+                      : sessionUpdate({ sessionId: "mock-session-1", update });
+                  yield* send({
+                    sessionUpdate: "tool_call",
+                    ...launchFrame,
+                    status: "in_progress",
+                  });
+                  yield* send({
+                    sessionUpdate: "tool_call_update",
+                    ...launchFrame,
+                    status: "completed",
+                  });
+                  yield* send({
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "I have launched a subagent." },
+                  });
+                  return { stopReason: "end_turn" as const };
+                }),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-wake"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      yield* session.startTurn({
+        appThread: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project-antigravity-wake"),
+          title: "Antigravity wake",
+          providerInstanceId: instanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+          activeProviderThreadId: providerThread.id,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+        threadId,
+        runId: RunId.make("run-antigravity-wake"),
+        runOrdinal: 1,
+        providerTurnOrdinal: 1,
+        attemptId: RunAttemptId.make("attempt-antigravity-wake"),
+        rootNodeId: NodeId.make("node-antigravity-wake"),
+        providerThread,
+        message: {
+          createdBy: "user",
+          creationSource: "web",
+          messageId: MessageId.make("message-antigravity-wake"),
+          text: "count the lines in README.md with a subagent",
+          attachments: [],
+        },
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = Array.from(
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+        ),
+      );
+
+      const terminalIndex = events.findIndex((event) => event.type === "turn.terminal");
+      const lastSubagent = events.findLast((event) => event.type === "subagent.updated");
+      assert.equal(
+        lastSubagent?.type === "subagent.updated" && lastSubagent.subagent.status,
+        "completed",
+      );
+      assert.equal(
+        lastSubagent?.type === "subagent.updated" && lastSubagent.subagent.result,
+        answer,
+      );
+      assert.isBelow(events.indexOf(lastSubagent!), terminalIndex);
+      const messageText = events.findLast(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "assistant_message" &&
+          event.turnItem.text.includes(answer),
+      );
+      assert.isDefined(messageText);
+      assert.isBelow(events.indexOf(messageText!), terminalIndex);
+      const terminal = events[terminalIndex];
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
