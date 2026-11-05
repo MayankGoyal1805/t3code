@@ -272,7 +272,8 @@ export function makeAntigravityAcpAdapterFlavor(
   const missingConversation = (sessionId: string) =>
     new EffectAcpErrors.AcpRequestError({
       code: -32002,
-      errorMessage: `Antigravity has no conversation ${sessionId}. It was created by an older T3 Code runtime or deleted from agy's history, so it cannot be resumed. Start a new thread.`,
+      method: "session/load",
+      errorMessage: `Antigravity has no conversation ${sessionId}. It was created by an older T3 Code runtime or deleted from agy's history.`,
     });
   const requireConversation = (sessionId: string) =>
     profileDirectory === undefined
@@ -286,9 +287,6 @@ export function makeAntigravityAcpAdapterFlavor(
         );
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
-      if (input.resumeSessionId !== undefined) {
-        yield* requireConversation(input.resumeSessionId);
-      }
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -315,13 +313,13 @@ export function makeAntigravityAcpAdapterFlavor(
             Effect.andThen(runtime.resumeSession(sessionId, activation)),
           ),
         start: () =>
-          runtime
-            .start()
-            .pipe(
-              Effect.tap(
-                (started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void,
-              ),
-            ),
+          (input.resumeSessionId === undefined
+            ? Effect.void
+            : requireConversation(input.resumeSessionId)
+          ).pipe(
+            Effect.andThen(runtime.start()),
+            Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
+          ),
       } satisfies typeof runtime;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),

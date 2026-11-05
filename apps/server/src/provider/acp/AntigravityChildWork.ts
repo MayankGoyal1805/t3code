@@ -57,6 +57,22 @@ interface AntigravityChildLaunch {
   readonly model: string | null;
 }
 
+const SUBAGENT_MODEL_LABELS: Record<string, string | null> = {
+  inherit: null,
+  flash_lite: "Gemini Flash Lite",
+  flash: "Gemini Flash",
+  pro: "Gemini Pro",
+};
+
+/** agy names a subagent's model by tier; `inherit` means the parent's, which the thread already shows. */
+const antigravitySubagentModelLabel = (model: string | null | undefined): string | null => {
+  const trimmed = model?.trim();
+  if (trimmed === undefined || trimmed.length === 0) return null;
+  return Object.hasOwn(SUBAGENT_MODEL_LABELS, trimmed)
+    ? (SUBAGENT_MODEL_LABELS[trimmed] ?? null)
+    : trimmed;
+};
+
 const decodeLaunchInput = Schema.decodeUnknownOption(
   Schema.Struct({
     Role: Schema.String,
@@ -71,7 +87,11 @@ export function antigravitySubagentLaunches(
 ): ReadonlyArray<AntigravityChildLaunch> | undefined {
   return Option.getOrUndefined(
     Option.map(decodeLaunchInput(input), (decoded) => [
-      { role: decoded.Role, prompt: decoded.Prompt, model: decoded.Model ?? null },
+      {
+        role: decoded.Role,
+        prompt: decoded.Prompt,
+        model: antigravitySubagentModelLabel(decoded.Model),
+      },
     ]),
   );
 }
@@ -129,7 +149,7 @@ export const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => 
   const launches = messages(invoke, 1).map((spec) => ({
     role: text(spec, 2) ?? "",
     prompt: text(spec, 3) ?? "",
-    model: text(spec, 12) ?? null,
+    model: antigravitySubagentModelLabel(text(spec, 12)),
   }));
   return launches.length === conversationIds.length && conversationIds.length <= MAX_CHILDREN
     ? { toolCallId, launches, conversationIds }

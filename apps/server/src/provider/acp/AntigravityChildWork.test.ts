@@ -33,13 +33,22 @@ it("reads the launch from the ACP tool input, one subagent per call", () => {
     Role: LAUNCH.role,
     TypeName: "self",
   });
-  expect(launches).toEqual([LAUNCH]);
+  expect(launches).toEqual([{ ...LAUNCH, model: "Gemini Flash Lite" }]);
   expect(describeAntigravitySubagentLaunches(launches!)).toEqual({
     title: LAUNCH.role,
     prompt: LAUNCH.prompt,
-    model: LAUNCH.model,
+    model: "Gemini Flash Lite",
   });
   expect(antigravitySubagentLaunches({ Subagents: [] })).toBeUndefined();
+});
+
+it("labels agy's subagent model tiers and drops the inherited one", () => {
+  const modelOf = (Model: string) =>
+    antigravitySubagentLaunches({ Model, Prompt: "p", Role: "r" })?.[0]?.model;
+  expect(modelOf("flash_lite")).toBe("Gemini Flash Lite");
+  expect(modelOf("pro")).toBe("Gemini Pro");
+  expect(modelOf("inherit")).toBeNull();
+  expect(modelOf("gemini-x")).toBe("gemini-x");
 });
 
 it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {

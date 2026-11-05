@@ -101,7 +101,7 @@ describe("AntigravityAdapterV2 flavor", () => {
       },
     });
     assert.equal(launch?.title, "Readme Reader");
-    assert.equal(launch?.model, "flash_lite");
+    assert.equal(launch?.model, "Gemini Flash Lite");
     assert.equal(launch?.prompt, "Read README.md");
   });
 
@@ -956,17 +956,21 @@ it.layer(NodeServices.layer)("AntigravityAdapterV2 stored conversations", (it) =
       const error = yield* runtime.loadSession(unknownId, undefined as never).pipe(Effect.flip);
       assert.deepEqual(loaded, [storedId]);
       assert.equal(error._tag, "AcpRequestError");
-      assert.include(error.message, "Start a new thread");
+      assert.include(error.message, "no conversation");
     }).pipe(Effect.scoped, Effect.provideService(SecureRandom.SecureRandom, undefined as never)),
   );
 
-  it.effect("does not start a runtime for a stored conversation that is gone", () =>
+  // The shared adapter only falls back to a fresh session with a handoff when `start` fails on `session/load`.
+  it.effect("fails start with a session/load error for a stored conversation that is gone", () =>
     Effect.gen(function* () {
       const { flavor } = yield* makeStoredFlavor();
-      const error = yield* flavor
-        .makeRuntime({ cwd: "/work", resumeSessionId: unknownId } as never)
-        .pipe(Effect.flip);
+      const runtime = yield* flavor.makeRuntime({
+        cwd: "/work",
+        resumeSessionId: unknownId,
+      } as never);
+      const error = yield* runtime.start().pipe(Effect.flip);
       assert.equal(error._tag, "AcpRequestError");
+      assert.equal("method" in error ? error.method : undefined, "session/load");
     }).pipe(Effect.scoped, Effect.provideService(SecureRandom.SecureRandom, undefined as never)),
   );
 });
