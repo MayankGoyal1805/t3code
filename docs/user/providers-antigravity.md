@@ -125,8 +125,8 @@ To check access and reload models, use **Refresh provider status** in web or des
 provider settings, or **Refresh models** in mobile thread settings. If asked to
 sign in again, use provider settings on web or desktop, or **Settings > Providers** on mobile.
 
-Threads started before Antigravity moved to the `agy` CLI may not continue their earlier agent
-conversation and may need a new thread.
+Threads started before Antigravity moved to the `agy` CLI keep working. Their next message
+starts a new `agy` conversation with the earlier conversation handed over.
 
 If Google reports `SUBSCRIPTION_REQUIRED`, an account restriction, or a usage limit,
 follow the provider's message and any retry time. See [Google's account plans][plans]

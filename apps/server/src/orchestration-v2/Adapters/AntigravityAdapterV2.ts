@@ -10,7 +10,9 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Clock from "effect/Clock";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
 import type * as EffectAcpSchema from "effect-acp/compat";
@@ -34,7 +36,7 @@ import {
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "../../provider/acp/AntigravityChildWork.ts";
-import { rollbackAntigravityConversation } from "../../provider/acp/AntigravityRollback.ts";
+import { rollbackAntigravityConversationOffThread } from "../../provider/acp/AntigravityRollback.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   makeAntigravityWakeTracker,
@@ -170,6 +172,24 @@ interface AntigravityFlavorServices {
 type AntigravityRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"];
 
 const WAKE_POLL_INTERVAL = "1 second";
+const WAKE_MAX_AGE_MILLIS = 30 * 60 * 1000;
+
+const wakeExpiredNotification = (
+  sessionId: string,
+  toolCallId: string,
+  launchInput: unknown,
+): EffectAcpSchema.SessionNotification => ({
+  sessionId,
+  update: {
+    sessionUpdate: "tool_call_update",
+    toolCallId,
+    title: "Run invoke_subagent",
+    kind: "other",
+    status: "failed",
+    rawInput: launchInput,
+    rawOutput: "The subagent did not report back.",
+  },
+});
 
 const wakeNotification = (
   sessionId: string,
@@ -192,10 +212,9 @@ const wakeNotification = (
 });
 
 /**
- * agy sends nothing over ACP when a subagent reports back and the parent runs on. Its session
- * log has that follow-up, so while a launched subagent is outstanding the log is read and the
- * follow-up is handed to the adapter as the updates the stream lacks. The launch stays running
- * until then, which keeps the turn open.
+ * agy streams nothing when a subagent reports back; its session log holds the follow-up, which is
+ * read while a launch is outstanding. Following ends with the turn (new prompt, cancel), a failed
+ * launch, or the age cap, so a late wake never reaches another turn.
  */
 function followSubagentWake(
   runtime: AntigravityRuntime,
@@ -205,21 +224,38 @@ function followSubagentWake(
   const tracker = makeAntigravityWakeTracker();
   const launchInputs = new Map<string, unknown>();
   let deliver: Parameters<AntigravityRuntime["handleSessionUpdate"]>[0] | undefined;
-  let following = false;
+  let following: Fiber.Fiber<void> | undefined;
+
+  const send = (notification: EffectAcpSchema.SessionNotification) =>
+    (deliver?.(notification) ?? Effect.void).pipe(Effect.ignore);
+
+  const endTurn = Effect.suspend(() => {
+    const fiber = following;
+    following = undefined;
+    tracker.reset();
+    launchInputs.clear();
+    return fiber === undefined ? Effect.void : Fiber.interrupt(fiber);
+  });
 
   const follow = Effect.fn("AntigravityAdapterV2.followSubagentWake")(function* (
     sessionId: string,
   ) {
+    const startedAt = yield* Clock.currentTimeMillis;
     while (tracker.pending()) {
       const steps = yield* readAntigravityWakeSteps(profileDirectory, sessionId, tracker.cursor());
       for (const output of tracker.advance(steps)) {
         const launchInput =
           output.type === "completed" ? launchInputs.get(output.toolCallId) : null;
-        yield* (deliver?.(wakeNotification(sessionId, output, launchInput)) ?? Effect.void).pipe(
-          Effect.ignore,
-        );
+        yield* send(wakeNotification(sessionId, output, launchInput));
       }
       if (!tracker.pending()) break;
+      if ((yield* Clock.currentTimeMillis) - startedAt >= WAKE_MAX_AGE_MILLIS) {
+        for (const toolCallId of tracker.pendingIds()) {
+          tracker.drop(toolCallId);
+          yield* send(wakeExpiredNotification(sessionId, toolCallId, launchInputs.get(toolCallId)));
+        }
+        break;
+      }
       yield* Effect.sleep(WAKE_POLL_INTERVAL);
     }
   });
@@ -232,6 +268,15 @@ function followSubagentWake(
       }
       return;
     }
+    if (
+      update.sessionUpdate === "tool_call_update" &&
+      update.status === "failed" &&
+      tracker.tracks(update.toolCallId)
+    ) {
+      tracker.drop(update.toolCallId);
+      launchInputs.delete(update.toolCallId);
+      return;
+    }
     // A replayed history carries finished launches; only a live launch has a wake to follow.
     if (
       update.sessionUpdate !== "tool_call" ||
@@ -242,16 +287,16 @@ function followSubagentWake(
     }
     tracker.launch(update.toolCallId);
     launchInputs.set(update.toolCallId, update.rawInput);
-    if (following) return;
-    following = true;
-    yield* follow(notification.sessionId).pipe(
+    if (following !== undefined) return;
+    const fiber = yield* follow(notification.sessionId).pipe(
       Effect.ensuring(
         Effect.sync(() => {
-          following = false;
+          if (following === fiber) following = undefined;
         }),
       ),
       Effect.forkIn(scope),
     );
+    following = fiber;
   });
 
   return {
@@ -262,6 +307,8 @@ function followSubagentWake(
         observe(notification).pipe(Effect.andThen(handler(notification))),
       );
     },
+    prompt: (payload, options) => endTurn.pipe(Effect.andThen(runtime.prompt(payload, options))),
+    cancel: endTurn.pipe(Effect.andThen(runtime.cancel)),
   };
 }
 
@@ -338,7 +385,7 @@ export function makeAntigravityAcpAdapterFlavor(
     const terminalTurns = providerThreadTurns.filter(
       (turn) => turn.nativeTurnRef !== null && TERMINAL_TURN_STATUSES.has(turn.status),
     );
-    return yield* rollbackAntigravityConversation({
+    return yield* rollbackAntigravityConversationOffThread(options.selfInvocation, {
       conversationsDir: options.path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS),
       sessionId: nativeSessionId,
       keepTurns: terminalTurns.filter((turn) => turn.ordinal <= target.providerTurn.ordinal).length,

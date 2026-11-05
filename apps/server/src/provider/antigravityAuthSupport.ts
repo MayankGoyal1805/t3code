@@ -175,16 +175,18 @@ export const readAntigravityBrowserCapture = Effect.fn("readAntigravityBrowserCa
   return text.trim() || undefined;
 });
 
-/** The sign-in URL appears once, when agy launches its browser; stop after handing it over. */
+/** agy launches its browser again when a sign-in is retried, so each new URL is handed over until the flow's scope closes. */
 export const watchAntigravityAuthorizationUrl = Effect.fn("watchAntigravityAuthorizationUrl")(
   function* (
     target: string,
     onAuthorizationUrl: (url: string) => Effect.Effect<void, AcpErrors.AcpError>,
   ) {
+    let delivered: string | undefined;
     for (;;) {
       const url = yield* readAntigravityBrowserCapture(target);
-      if (url !== undefined) {
-        return yield* onAuthorizationUrl(url).pipe(
+      if (url !== undefined && url !== delivered) {
+        delivered = url;
+        yield* onAuthorizationUrl(url).pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Antigravity sign-in URL was rejected.", { cause }),
           ),

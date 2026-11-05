@@ -21,6 +21,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/process";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
@@ -32,6 +33,8 @@ import {
   CALL_ID,
   CHILD,
   LAUNCH,
+  ROOT,
+  appendSteps,
   invokeStep,
   plannerStep,
   wakeMessageStep,
@@ -971,6 +974,125 @@ it.layer(NodeServices.layer)("AntigravityAdapterV2 stored conversations", (it) =
       const error = yield* runtime.start().pipe(Effect.flip);
       assert.equal(error._tag, "AcpRequestError");
       assert.equal("method" in error ? error.method : undefined, "session/load");
+    }).pipe(Effect.scoped, Effect.provideService(SecureRandom.SecureRandom, undefined as never)),
+  );
+});
+
+it.layer(NodeServices.layer)("AntigravityAdapterV2 wake following", (it) => {
+  const CHILD_TWO = "0f1e2d3c-4b5a-4968-8776-655443322110";
+  const CALL_TWO = "call_2";
+  const userStep = { type: 14, payload: new Uint8Array(), metadata: new Uint8Array() };
+  const launchRows = (callId: string, child: string) => [
+    userStep,
+    plannerStep({ calls: [{ id: callId, name: "invoke_subagent", args: "{}" }] }),
+    invokeStep({ callId, launches: [LAUNCH], children: [child] }),
+    plannerStep({ text: "I have launched a subagent." }),
+  ];
+  const launchFrame = (toolCallId: string) =>
+    ({
+      toolCallId,
+      title: "Run invoke_subagent",
+      kind: "other",
+      rawInput: { Prompt: LAUNCH.prompt },
+    }) as const;
+
+  const setup = Effect.fn("AntigravityAdapterV2Test.setupWake")(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const profile = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-wake-" });
+    const conversations = path.join(profile, ...ANTIGRAVITY_CONVERSATION_SEGMENTS);
+    yield* fileSystem.makeDirectory(conversations, { recursive: true });
+    const file = path.join(conversations, `${ROOT}.db`);
+    writeConversation(file, launchRows(CALL_ID, CHILD));
+    const delivered: Array<EffectAcpSchema.SessionUpdate> = [];
+    let handler: Parameters<
+      AcpSessionRuntime.AcpSessionRuntime["Service"]["handleSessionUpdate"]
+    >[0];
+    const settled = yield* Deferred.make<void>();
+    const record: typeof handler = ({ update }) =>
+      Effect.sync(() => {
+        delivered.push(update);
+        if (
+          update.sessionUpdate === "tool_call_update" &&
+          (update.status === "completed" || update.status === "failed")
+        ) {
+          Deferred.doneUnsafe(settled, Effect.void);
+        }
+      });
+    const stub = {
+      handleSessionUpdate: (next: typeof handler) =>
+        Effect.sync(() => {
+          handler = next;
+        }),
+      prompt: () => Effect.succeed({ stopReason: "end_turn" as const }),
+      cancel: Effect.void,
+    };
+    const flavor = makeAntigravityAcpAdapterFlavor({
+      instanceId: ProviderInstanceId.make("antigravity-wake-follow"),
+      random: undefined as never,
+      fileSystem,
+      path,
+      host: { paths: { attachmentsDir: "/attachments" } } as never,
+      selfInvocation: undefined as never,
+      makeRuntime: () => Effect.succeed(stub as never),
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+      profileDirectory: profile,
+    });
+    const runtime = yield* flavor.makeRuntime({ cwd: "/work" } as never);
+    yield* runtime.handleSessionUpdate(record);
+    const launch = (toolCallId: string) =>
+      handler({
+        sessionId: ROOT,
+        update: { sessionUpdate: "tool_call", ...launchFrame(toolCallId), status: "in_progress" },
+      });
+    return { runtime, file, delivered, settled, launch };
+  });
+
+  const completions = (delivered: ReadonlyArray<EffectAcpSchema.SessionUpdate>) =>
+    delivered.flatMap((update) =>
+      update.sessionUpdate === "tool_call_update" && update.status === "completed"
+        ? [update.toolCallId]
+        : [],
+    );
+
+  it.effect("does not carry a cancelled turn's launch into the next turn", () =>
+    Effect.gen(function* () {
+      const { runtime, file, delivered, settled, launch } = yield* setup();
+      yield* launch(CALL_ID);
+      yield* runtime.prompt({ prompt: [] });
+      yield* TestClock.adjust("5 seconds");
+      yield* runtime.cancel;
+      // The next turn's log also holds a late report for the cancelled launch.
+      appendSteps(
+        file,
+        [
+          ...launchRows(CALL_TWO, CHILD_TWO),
+          wakeMessageStep(CHILD, "stale-report"),
+          plannerStep({ text: "stale-answer" }),
+          wakeMessageStep(CHILD_TWO, "two"),
+          plannerStep({ text: "two answer" }),
+        ],
+        4,
+      );
+      yield* runtime.prompt({ prompt: [] });
+      yield* launch(CALL_TWO);
+      yield* Deferred.await(settled);
+      assert.deepEqual(completions(delivered), [CALL_TWO]);
+      assert.notInclude(JSON.stringify(delivered), "stale-");
+    }).pipe(Effect.scoped, Effect.provideService(SecureRandom.SecureRandom, undefined as never)),
+  );
+
+  it.effect("fails a launch that never reports back once it is too old", () =>
+    Effect.gen(function* () {
+      const { delivered, settled, launch } = yield* setup();
+      yield* launch(CALL_ID);
+      yield* TestClock.adjust("31 minutes");
+      yield* Deferred.await(settled);
+      const failed = delivered.find(
+        (update) => update.sessionUpdate === "tool_call_update" && update.status === "failed",
+      );
+      assert.equal(failed?.sessionUpdate === "tool_call_update" && failed.toolCallId, CALL_ID);
     }).pipe(Effect.scoped, Effect.provideService(SecureRandom.SecureRandom, undefined as never)),
   );
 });

@@ -170,16 +170,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
     }),
   );
 
-  it.effect("rejects a different second authorization URL", () =>
+  it.effect("shows the newest authorization URL when agy relaunches its browser", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({
-        authorizationUrls: [authorizationUrl, `${authorizationUrl}&scope=another-request`],
-      });
+      const retried = `${authorizationUrl}&scope=another-request`;
+      const harness = yield* makeHarness({ authorizationUrls: [authorizationUrl, retried] });
       yield* harness.auth.controller.start(owner);
 
-      const failed = yield* phase(harness.auth, "failed");
-      assert.isNull(failed.authorizationUrl);
-      assert.deepEqual(harness.catalog(), ["previous-account-model"]);
+      const waiting = yield* phase(harness.auth, "waiting");
+      assert.equal(waiting.authorizationUrl, retried);
     }),
   );
 

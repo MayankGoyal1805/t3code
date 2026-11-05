@@ -60,7 +60,8 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     summaryStatus?: number;
     /** Per-host summary statuses; hosts not listed fall back to `summaryStatus`. */
     summaryStatusByHost?: Record<string, number>;
-    email?: string;
+    /** null leaves the email out of the token. */
+    email?: string | null;
     expiry?: string;
     missingToken?: boolean;
     authMethod?: "oauth-personal" | "gemini-api-key";
@@ -71,16 +72,17 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const profileDirectory = yield* fs.makeTempDirectoryScoped();
   yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-cli"));
   const tokenPath = path.join(profileDirectory, "antigravity-cli", "antigravity-oauth-token");
-  const writeToken = (email: string, expiry = options.expiry ?? "2099-01-01T00:00:00Z") =>
+  const writeToken = (email: string | null, expiry = options.expiry ?? "2099-01-01T00:00:00Z") =>
     fs.writeFileString(
       tokenPath,
       JSON.stringify({
         token: { access_token: "access-token", token_type: "Bearer", expiry },
         auth_method: "oauth-personal",
-        id_token_email: email,
+        ...(email === null ? {} : { id_token_email: email }),
       }),
     );
-  if (!options.missingToken) yield* writeToken(options.email ?? "someone@example.com");
+  if (!options.missingToken)
+    yield* writeToken(options.email === undefined ? "someone@example.com" : options.email);
   const requests: Array<{ url: string; body: string }> = [];
   const http = HttpClient.make((request, url, _signal, fiber) =>
     Effect.sync(() => {
@@ -493,6 +495,14 @@ describe("Antigravity subscription limits", () => {
       expect(machineB.credentialFingerprint).toBe(machineA.credentialFingerprint);
       expect(otherAccount.credentialFingerprint).not.toBe(machineA.credentialFingerprint);
       expect(JSON.stringify(machineA)).not.toMatch(/someone@example.com|access-token/);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("does not name an account whose email is unknown", () =>
+    Effect.gen(function* () {
+      const limits = yield* fixture({ email: null }).pipe(Effect.flatMap((usage) => usage.probe));
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.credentialFingerprint).toBeUndefined();
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 

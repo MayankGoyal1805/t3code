@@ -15,6 +15,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   applyAntigravityAcpModelSelection,
+  antigravityModelsToProbeForThinking,
   antigravitySessionMeta,
   buildAntigravityPrompt,
 } from "./AntigravityAcpSupport.ts";
@@ -81,6 +82,41 @@ describe("Antigravity system prompt", () => {
     expect(
       antigravitySessionMeta({ protocolVersion: 1, agentCapabilities: {} }, "<pr/>"),
     ).toBeUndefined();
+  });
+});
+
+describe("antigravityModelsToProbeForThinking", () => {
+  const model = {
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    currentValue: "a",
+    options: [
+      { value: "a", name: "A" },
+      { value: "b", name: "B" },
+      { value: "c", name: "C" },
+    ],
+  } satisfies EffectAcpSchema.SessionConfigOption;
+  const thinking = {
+    id: "thought_level",
+    name: "Thinking",
+    category: "thought_level",
+    type: "select",
+    currentValue: "low",
+    options: [{ value: "low", name: "Low" }],
+  } satisfies EffectAcpSchema.SessionConfigOption;
+  const configOptions = (withThinking: boolean) => (withThinking ? [model, thinking] : [model]);
+
+  it.each([
+    { name: "first probe", options: configOptions(true), known: [], expected: ["b", "c", "a"] },
+    { name: "new model", options: configOptions(true), known: ["a", "b"], expected: ["c", "a"] },
+    { name: "all known", options: configOptions(true), known: ["a", "b", "c"], expected: [] },
+    { name: "no thinking levels", options: configOptions(false), known: [], expected: [] },
+  ])("$name", ({ options, known, expected }) => {
+    expect(antigravityModelsToProbeForThinking(options, (model) => known.includes(model))).toEqual(
+      expected,
+    );
   });
 });
 

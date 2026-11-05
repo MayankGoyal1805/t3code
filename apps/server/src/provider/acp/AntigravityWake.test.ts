@@ -107,6 +107,59 @@ describe("AntigravityWakeTracker", () => {
     ]);
   });
 
+  it.each([
+    {
+      name: "a short reply that repeats the launch note",
+      live: "Done.",
+      rows: [
+        ...launchedLog.slice(0, 3),
+        plannerStep({ text: "Done." }),
+        wake,
+        plannerStep({ text: "Done." }),
+      ],
+      texts: ["Done."],
+    },
+    {
+      name: "a follow-up the stream carried with other whitespace",
+      live: "README.md has\n1   line.",
+      rows: [...launchedLog, wake, answer],
+      texts: [],
+    },
+    {
+      name: "a follow-up the stream did not carry",
+      live: "I have launched a subagent.",
+      rows: [...launchedLog, wake, answer],
+      texts: ["README.md has 1 line."],
+    },
+  ] as const)("shows only unseen text for $name", ({ live, rows, texts }) => {
+    const { outputs } = track(rows, live);
+    assert.deepEqual(
+      outputs.flatMap((output) => (output.type === "text" ? [output.text] : [])),
+      [...texts],
+    );
+    assert.equal(outputs.at(-1)?.type, "completed");
+  });
+
+  it("completes the wake when the final planner step is too large to read", () => {
+    const { tracker, outputs } = track([...launchedLog, wake]);
+    assert.deepEqual(outputs, []);
+    const oversized = { idx: 5, type: 15, status: 3, payload: null };
+    const result = tracker.advance([oversized]);
+    assert.equal(result.at(-1)?.type, "completed");
+    assert.equal(tracker.pending(), false);
+  });
+
+  it("forgets dropped launches and starts a turn clean on reset", () => {
+    const { tracker } = track(launchedLog);
+    tracker.drop(CALL_ID);
+    assert.equal(tracker.pending(), false);
+    tracker.launch(CALL_ID);
+    tracker.observeLiveText("hello");
+    tracker.reset();
+    assert.equal(tracker.pending(), false);
+    assert.equal(tracker.cursor(), undefined);
+  });
+
   it("carries on from the last finished step", () => {
     const { tracker } = track([...launchedLog, wake]);
     assert.equal(tracker.cursor(), 4);

@@ -27,6 +27,8 @@ const INBOUND_CONTENT = 4;
 const MAX_STEP_BYTES = 1024 * 1024;
 const SENDER = /\bsender=([A-Za-z0-9-]+)/;
 const LIVE_TEXT_LIMIT = 16 * 1024;
+const OVERSIZED_STEP_TEXT = "(The agent's reply was too large to show here.)";
+const squash = (value: string) => value.replace(/\s+/g, " ").trim();
 
 export interface AntigravityWakeStep {
   readonly idx: number;
@@ -65,6 +67,7 @@ const plannerResponse = (payload: Uint8Array) => {
 };
 
 /**
+ * One turn's wake state; `reset` starts the next turn clean.
  * Follows `invoke_subagent` calls through the parent's steps: the record that names the
  * child, the child's message back, and the planner steps of the run that message wakes.
  * That run ends at the first planner step without tool calls.
@@ -78,9 +81,51 @@ export function makeAntigravityWakeTracker() {
   let liveText = "";
   let runHasText = false;
 
+  const forget = (toolCallId: string) => {
+    launched.delete(toolCallId);
+    woken.delete(toolCallId);
+    for (const [childId, call] of childCalls) {
+      if (call === toolCallId) childCalls.delete(childId);
+    }
+  };
+
+  // Steps the stream delivered keep their place in the buffer until their log copy is seen.
+  const consumeLive = (planned: string) => {
+    const needle = squash(planned);
+    if (needle.length === 0) return false;
+    const live = squash(liveText);
+    const at = live.indexOf(needle);
+    if (at < 0) return false;
+    liveText = live.slice(at + needle.length);
+    return true;
+  };
+
+  const finishRun = (outputs: Array<AntigravityWakeOutput>) => {
+    for (const [toolCallId, result] of woken) {
+      outputs.push({ type: "completed", toolCallId, result });
+      forget(toolCallId);
+    }
+    woken.clear();
+    wakeStep = undefined;
+    runHasText = false;
+  };
+
   return {
     launch: (toolCallId: string) => {
       launched.add(toolCallId);
+    },
+    tracks: (toolCallId: string) => launched.has(toolCallId),
+    pendingIds: () => [...launched],
+    /** A launch that failed or was cancelled has no wake to wait for. */
+    drop: forget,
+    reset: () => {
+      launched.clear();
+      childCalls.clear();
+      woken.clear();
+      cursor = undefined;
+      wakeStep = undefined;
+      liveText = "";
+      runHasText = false;
     },
     /** Text the stream already delivered, so the log's copy of it is not shown twice. */
     observeLiveText: (chunk: string) => {
@@ -94,7 +139,17 @@ export function makeAntigravityWakeTracker() {
         // A step still being written is read again, so output keeps the log's order.
         if (step.status !== STEP_DONE) break;
         cursor = step.idx;
-        if (step.payload === null) continue;
+        if (step.payload === null) {
+          // An oversized planner step cannot be read, but it must still end the wake.
+          if (step.type === PLANNER_STEP && wakeStep !== undefined) {
+            outputs.push({
+              type: "text",
+              text: `${runHasText ? "\n\n" : ""}${OVERSIZED_STEP_TEXT}`,
+            });
+            finishRun(outputs);
+          }
+          continue;
+        }
         if (step.type === TOOL_STEP) {
           const record = decodeInvokeRecord(step.payload);
           if (record !== undefined && launched.has(record.toolCallId)) {
@@ -108,25 +163,17 @@ export function makeAntigravityWakeTracker() {
             woken.set(toolCallId, inbound.content);
             wakeStep ??= step.idx;
           }
-        } else if (step.type === PLANNER_STEP && wakeStep !== undefined) {
+        } else if (step.type === PLANNER_STEP) {
           const planner = plannerResponse(step.payload);
           if (planner === undefined) continue;
-          if (planner.text.length > 0 && !liveText.includes(planner.text)) {
+          // Steps before the wake belong to the prompt the stream carried.
+          const delivered = consumeLive(planner.text);
+          if (wakeStep === undefined) continue;
+          if (planner.text.length > 0 && !delivered) {
             outputs.push({ type: "text", text: `${runHasText ? "\n\n" : ""}${planner.text}` });
             runHasText = true;
           }
-          if (!planner.hasToolCalls) {
-            for (const [toolCallId, result] of woken) {
-              outputs.push({ type: "completed", toolCallId, result });
-              launched.delete(toolCallId);
-              for (const [childId, call] of childCalls) {
-                if (call === toolCallId) childCalls.delete(childId);
-              }
-            }
-            woken.clear();
-            wakeStep = undefined;
-            runHasText = false;
-          }
+          if (!planner.hasToolCalls) finishRun(outputs);
         }
       }
       return outputs;

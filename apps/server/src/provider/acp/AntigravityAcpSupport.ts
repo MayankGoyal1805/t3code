@@ -126,7 +126,7 @@ export function antigravityRuntimeModeForSessionMode(modeId: string): RuntimeMod
   }
 }
 
-export function antigravityModelOptions(
+function antigravityModelOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
 ) {
   const model = configOptions.find((option) => option.id === "model");
@@ -140,6 +140,24 @@ export function antigravityThinkingConfig(
 ) {
   const option = configOptions?.find((candidate) => candidate.category === "thought_level");
   return option?.type === "select" ? option : undefined;
+}
+
+/**
+ * Models to select so agy reports their thinking levels, which it gives only for the selected one.
+ * The selected model goes last to restore the session; nothing is selected when all are known.
+ */
+export function antigravityModelsToProbeForThinking(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+  hasThinkingLevels: (model: string) => boolean,
+): ReadonlyArray<string> {
+  const current = configOptions.find((option) => option.id === "model")?.currentValue;
+  if (antigravityThinkingConfig(configOptions) === undefined || typeof current !== "string") {
+    return [];
+  }
+  const unknown = antigravityModelOptions(configOptions)
+    .map((option) => option.value)
+    .filter((model) => model !== current && !hasThinkingLevels(model));
+  return unknown.length === 0 ? [] : [...unknown, current];
 }
 
 const BUNDLE_FLASH_MODEL = /^gemini-3\.[678]-flash-(low|medium|high)$/;

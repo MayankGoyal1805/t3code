@@ -247,13 +247,8 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
         lock.withPermits(1)(
           Effect.gen(function* () {
             if (activeFlow !== flow || operation !== "auth") return;
-            if (flow.pending) {
-              if (flow.pending.authorizationUrl === authorization.authorizationUrl) return;
-              return yield* new AcpErrors.AcpTransportError({
-                detail: "Antigravity started more than one Google sign-in request.",
-                cause: undefined,
-              });
-            }
+            if (flow.pending?.authorizationUrl === authorization.authorizationUrl) return;
+            // agy relaunches its browser when it retries; the newest request supersedes the last.
             flow.pending = authorization;
             yield* publishFlow(flow, {
               ...flow.state,

@@ -225,7 +225,8 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       });
     }
     const accessToken = token.access_token;
-    const account = yield* sha256(`google-account\0${email ?? "unknown"}`);
+    // Without an email, accounts cannot be told apart, so none is named.
+    const account = email === undefined ? undefined : yield* sha256(`google-account\0${email}`);
     // Merge endpoints because quota groups differ; keep each bucket's most-used reading.
     const fetchWindows = Effect.fn("AntigravityUsageProbe.fetchWindows")(function* <E>(
       operation: string,
@@ -277,7 +278,10 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         message: "Antigravity did not return usable quota information.",
       });
     }
-    return { ...makeUsageLimits({ checkedAt, windows }), credentialFingerprint: account };
+    return {
+      ...makeUsageLimits({ checkedAt, windows }),
+      ...(account === undefined ? {} : { credentialFingerprint: account }),
+    };
   });
   const probe = read.pipe(
     Effect.timeout("30 seconds"),

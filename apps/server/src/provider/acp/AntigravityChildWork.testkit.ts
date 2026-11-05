@@ -224,6 +224,17 @@ export const writeConversation = (
   database.close();
 };
 
+export const appendSteps = (file: string, steps: ReadonlyArray<StepRow>, first: number) => {
+  const database = new NodeSqlite.DatabaseSync(file);
+  const insert = database.prepare(
+    "INSERT INTO steps (idx, step_type, status, metadata, step_payload) VALUES (?, ?, ?, ?, ?)",
+  );
+  steps.forEach((row, index) =>
+    insert.run(first + index, row.type, row.status ?? 3, row.metadata, row.payload),
+  );
+  database.close();
+};
+
 export const makeProfile = Effect.fn("makeProfile")(function* (input: {
   /** Defaults to a scoped temp directory. */
   readonly profile?: string;

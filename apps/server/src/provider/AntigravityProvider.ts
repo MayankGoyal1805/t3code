@@ -322,10 +322,14 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
     const supportsTextGeneration =
       initialized !== undefined && !authRequired ? yield* options.supportsTextGeneration : false;
-    if (authRequired) {
-      yield* resetUsage;
+    // A probe that began before a sign-in completed must not wipe what the sign-in discovered.
+    if (
+      authRequired &&
+      (yield* SubscriptionRef.get(metadata)).authRevision === before.authRevision
+    ) {
       discoveredSkills.clear();
       thinkingLevels.clear();
+      yield* resetUsage;
     }
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
@@ -557,6 +561,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
 
   return {
     snapshot: { ...managed, getSnapshot },
+    hasThinkingLevels: (model: string) => thinkingLevels.has(model),
     onSessionStarted,
     onConfigOptionsUpdated,
     onAvailableCommands,

@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
@@ -174,24 +175,26 @@ it.layer(NodeServices.layer)("Antigravity browser capture", (it) => {
         }
       }).pipe(Effect.scoped),
   );
-
-  it.effect("hands the captured URL to the sign-in flow once", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-capture-test-" });
-      const target = path.join(directory, "authorization-url");
-      yield* fs.writeFileString(target, `${authorizationUrl}\n`);
-      const received: Array<string> = [];
-      yield* watchAntigravityAuthorizationUrl(target, (url) =>
-        Effect.sync(() => {
-          received.push(url);
-        }),
-      ).pipe(Effect.provideService(FileSystem.FileSystem, fs));
-      expect(received).toEqual([authorizationUrl]);
-    }).pipe(Effect.scoped),
-  );
 });
+
+it.live("hands over each new captured URL once", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-capture-test-" });
+    const target = path.join(directory, "authorization-url");
+    const retried = authorizationUrl.replace("state=", "state=retry");
+    const received = yield* Queue.unbounded<string>();
+    yield* fs.writeFileString(target, `${authorizationUrl}\n`);
+    yield* watchAntigravityAuthorizationUrl(target, (url) => Queue.offer(received, url)).pipe(
+      Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.forkScoped,
+    );
+    expect(yield* Queue.take(received)).toBe(authorizationUrl);
+    yield* fs.writeFileString(target, `${retried}\n`);
+    expect(yield* Queue.take(received)).toBe(retried);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 describe("Antigravity sign-in errors", () => {
   it("recognizes native auth-required errors and the blocked-login transport error", () => {

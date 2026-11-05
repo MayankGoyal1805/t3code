@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -34,8 +35,7 @@ import {
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
-  antigravityModelOptions,
-  antigravityThinkingConfig,
+  antigravityModelsToProbeForThinking,
   makeAntigravityAcpRuntime,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
@@ -284,18 +284,19 @@ export const AntigravityDriver: ProviderDriver<
         mcpServers: [],
         ...(input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {}),
         ...(input.silentAuthRequired ? { silentAuthRequired: true } : {}),
+        // The conversation exists as soon as session/new answers, even if the rest of start fails.
+        requestLogger: (event) =>
+          Effect.sync(() => {
+            const created =
+              event.method === "session/new" && event.status === "succeeded"
+                ? Predicate.isObject(event.result)
+                  ? event.result.sessionId
+                  : undefined
+                : undefined;
+            if (typeof created === "string") sessionId = created;
+          }),
       });
-      return {
-        ...runtime,
-        start: () =>
-          runtime.start().pipe(
-            Effect.tap((started) =>
-              Effect.sync(() => {
-                sessionId = started.sessionId;
-              }),
-            ),
-          ),
-      };
+      return runtime;
     });
 
     const publishCatalog = Effect.fn("AntigravityDriver.publishCatalog")(function* (
@@ -304,6 +305,7 @@ export const AntigravityDriver: ProviderDriver<
         AcpSessionRuntime.AcpSessionRuntime["Service"],
         "getEvents" | "drainEvents" | "setModel"
       >,
+      force = false,
     ): Effect.fn.Return<void, never, Scope.Scope> {
       yield* provider.onSessionStarted(started);
       yield* Stream.runForEach(runtime.getEvents(), (event) => {
@@ -318,12 +320,12 @@ export const AntigravityDriver: ProviderDriver<
           : Effect.void;
       }).pipe(Effect.forkScoped);
       // Thinking levels differ per model and are reported only for the selected one.
-      const configOptions = started.sessionSetupResult.configOptions ?? [];
-      const current = configOptions.find((option) => option.id === "model")?.currentValue;
-      if (antigravityThinkingConfig(configOptions) !== undefined && typeof current === "string") {
-        for (const model of [...antigravityModelOptions(configOptions), { value: current }]) {
-          yield* runtime.setModel(model.value).pipe(Effect.ignore);
-        }
+      const known = (model: string) => provider.hasThinkingLevels(model);
+      for (const model of antigravityModelsToProbeForThinking(
+        started.sessionSetupResult.configOptions ?? [],
+        force ? () => false : known,
+      )) {
+        yield* runtime.setModel(model).pipe(Effect.ignore);
       }
       yield* runtime.drainEvents;
     }, Effect.scoped);
@@ -447,7 +449,7 @@ export const AntigravityDriver: ProviderDriver<
             Effect.gen(function* () {
               const runtime = yield* makeDisposableRuntime({});
               const started = yield* runtime.start();
-              yield* publishCatalog(started, runtime);
+              yield* publishCatalog(started, runtime, true);
             }),
           )
           .pipe(Effect.provideService(Scope.Scope, processScope));

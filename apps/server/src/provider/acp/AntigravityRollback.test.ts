@@ -1,4 +1,5 @@
 import * as NodeSqlite from "node:sqlite";
+import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -6,7 +7,10 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { rollbackAntigravityConversation } from "./AntigravityRollback.ts";
+import {
+  rollbackAntigravityConversation,
+  rollbackAntigravityConversationOffThread,
+} from "./AntigravityRollback.ts";
 
 const OLD_ID = "e6aba774-5472-4277-b6ee-27b2e05570a7";
 const NEW_ID = "11111111-2222-4333-8444-555555555555";
@@ -120,7 +124,7 @@ const rollback = (
   });
 
 describe("rollbackAntigravityConversation", () => {
-  it.effect("truncates a copy to the kept turns under a rewritten id", () =>
+  it.effect("truncates a copy to the kept turns under a new conversation id", () =>
     Effect.gen(function* () {
       const { directory, fs, sourceFile, newFile } = yield* setup;
       writeConversation(sourceFile);
@@ -138,15 +142,19 @@ describe("rollbackAntigravityConversation", () => {
 
       const rows = readRows(
         newFile,
-        "SELECT trajectory_id AS text, (SELECT data FROM trajectory_metadata_blob) AS blob, (SELECT metadata FROM steps WHERE idx = 0) AS meta, (SELECT step_payload FROM steps WHERE idx = 1) AS payload, (SELECT data FROM executor_metadata WHERE idx = 0) AS exec FROM trajectory_meta",
+        "SELECT cascade_id AS text, (SELECT data FROM trajectory_metadata_blob) AS blob, (SELECT metadata FROM steps WHERE idx = 0) AS meta, (SELECT step_payload FROM steps WHERE idx = 1) AS payload, (SELECT data FROM executor_metadata WHERE idx = 0) AS exec FROM trajectory_meta",
       );
       const row = rows[0];
       assert.equal(row?.text, NEW_ID);
-      assert.include(String(row?.meta), NEW_ID);
-      for (const value of [row?.blob, row?.payload, row?.exec]) {
+      const blobText = Buffer.from(row?.blob as Uint8Array).toString("latin1");
+      assert.include(blobText, NEW_ID);
+      assert.notInclude(blobText, OLD_ID);
+      // Step contents keep the old id: the source conversation and its artifacts stay in place.
+      assert.include(String(row?.meta), OLD_ID);
+      for (const value of [row?.payload, row?.exec]) {
         const text = Buffer.from(value as Uint8Array).toString("latin1");
-        assert.include(text, NEW_ID);
-        assert.notInclude(text, OLD_ID);
+        assert.include(text, OLD_ID);
+        assert.notInclude(text, NEW_ID);
       }
 
       // The source stays intact and no temp files remain.
@@ -188,6 +196,33 @@ describe("rollbackAntigravityConversation", () => {
       assert.deepEqual(
         (yield* fs.readDirectory(directory)).filter((name) => !name.startsWith(OLD_ID)),
         [],
+      );
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+
+  it.effect("runs the rollback in a separate process through the server entrypoint", () =>
+    Effect.gen(function* () {
+      const { directory, sourceFile, newFile } = yield* setup;
+      writeConversation(sourceFile);
+      const invocation = {
+        command: process.execPath,
+        entrypoint: NodeURL.fileURLToPath(new URL("../../bin.ts", import.meta.url)),
+      };
+      const input = {
+        conversationsDir: directory,
+        sessionId: OLD_ID,
+        keepTurns: 2,
+        expectedTurns: 3,
+        version: "1.5.1",
+        newSessionId: NEW_ID,
+      };
+
+      assert.deepEqual(yield* rollbackAntigravityConversationOffThread(invocation, input), {
+        sessionId: NEW_ID,
+      });
+      assert.equal(readRows(newFile, "SELECT idx FROM steps").length, 10);
+      assert.isUndefined(
+        yield* rollbackAntigravityConversationOffThread(invocation, { ...input, keepTurns: 0 }),
       );
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );

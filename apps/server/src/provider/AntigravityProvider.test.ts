@@ -406,6 +406,58 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
     ),
   );
 
+  it.effect(
+    "keeps what a sign-in discovered when a probe that began before it reports signed out",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness();
+          yield* harness.initialize;
+          const thinking = (currentValue: string) =>
+            ({
+              id: "thinking_level",
+              name: "Thinking Level",
+              category: "thought_level",
+              type: "select",
+              currentValue,
+              options: [
+                { value: "low", name: "Low" },
+                { value: "high", name: "High" },
+              ],
+            }) satisfies EffectAcpSchema.SessionConfigOption;
+          yield* harness.provider.onSessionStarted(started);
+          yield* harness.provider.onConfigOptionsUpdated([
+            { ...modelConfig, currentValue: "gemini-3.7-flash-high" },
+            thinking("low"),
+          ]);
+          yield* Ref.set(harness.authRequired, true);
+          yield* Ref.set(
+            harness.probe,
+            harness.provider
+              .onSessionStarted({
+                ...started,
+                sessionSetupResult: {
+                  ...sessionSetupResult,
+                  configOptions: [{ ...modelConfig, currentValue: "gemini-pro-agent" }],
+                },
+              })
+              .pipe(Effect.as(initializeResult)),
+          );
+          yield* harness.provider.snapshot.refresh;
+          yield* harness.provider.onConfigOptionsUpdated([
+            { ...modelConfig, currentValue: "gemini-pro-agent" },
+            thinking("high"),
+          ]);
+          const snapshot = yield* harness.provider.snapshot.getSnapshot;
+          expect(snapshot.auth.status).toBe("authenticated");
+          expect(
+            snapshot.models.find((model) => model.slug === "gemini-3.7-flash-high")?.capabilities
+              ?.optionDescriptors?.[0],
+          ).toMatchObject({ currentValue: "low" });
+        }),
+      ),
+  );
+
   it.effect("does not offer Auto, so Auto threads fall back to Supervised", () =>
     Effect.scoped(
       Effect.gen(function* () {
