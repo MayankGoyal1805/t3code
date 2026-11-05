@@ -37,6 +37,7 @@ import {
 import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 
 import { antigravityThinkingConfig } from "./acp/AntigravityAcpSupport.ts";
+import { isAntigravityRollbackVersionTested } from "./acp/AntigravityRollback.ts";
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
@@ -182,6 +183,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     ? `Antigravity is installed. Connect with ${options.auth.label} to load models.`
     : AUTH_UNCHECKED_MESSAGE;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const nextVersion = (version: string | null) => ({
+    version,
+    supportsConversationRollback: isAntigravityRollbackVersionTested(version ?? undefined),
+  });
   const initialDraft = {
     ...buildServerProvider({
       presentation: {
@@ -312,7 +317,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           ...draft,
           installed: !missingInstallation,
           // Lightweight custom-launcher probes lack versions; preserve the real handshake's version.
-          version: version === "unknown" ? draft.version : version || draft.version,
+          ...nextVersion(version === "unknown" ? draft.version : version || draft.version),
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
           checkedAt: updatedAt,
           usageLimits: missingInstallation ? undefined : draft.usageLimits,
@@ -388,7 +393,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           ...draft,
           installed: true,
           status: "ready",
-          version: started.initializeResult.agentInfo?.version || draft.version,
+          ...nextVersion(started.initializeResult.agentInfo?.version || draft.version),
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",

@@ -31,6 +31,8 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
+import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "../../provider/acp/AntigravityChildWork.ts";
+import { rollbackAntigravityConversation } from "../../provider/acp/AntigravityRollback.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
@@ -50,6 +52,13 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
+
+const TERMINAL_TURN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "interrupted",
+  "failed",
+  "cancelled",
+]);
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -87,13 +96,15 @@ export interface AntigravityAdapterV2Options {
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
+  /** The running agy version; rollback edits agy's private storage only for versions it was verified against. */
+  readonly version?: Effect.Effect<string | undefined>;
   /** The Gemini directory that holds agy's `antigravity-cli` data. Its conversations show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
 }
 
 /**
  * Native subagent tools report no child session ids, so children stay read-only.
- * Only permission prompts carry the launch; NativeChildWorkQuery matches their ids by this text.
+ * The tool call's `rawInput` carries the launch; NativeChildWorkQuery matches child ids by its text.
  */
 const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractSubagentUpdate"]> = (
   toolCall,
@@ -114,7 +125,7 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     title: launch?.title ?? ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-    model: null,
+    model: launch?.model ?? null,
     status,
     childSessionId: null,
     result: status === "failed" ? (antigravitySubagentOutput(toolCall) ?? null) : null,
@@ -191,6 +202,23 @@ export function makeAntigravityAcpAdapterFlavor(
     ),
   );
 
+  // Rolled-back state is a truncated copy of the native conversation, loaded under a new id.
+  const rollbackSession: AcpAdapterV2Flavor["rollbackSession"] = Effect.fn(
+    "AntigravityAdapterV2.rollbackSession",
+  )(function* ({ target, providerThreadTurns, nativeSessionId }) {
+    if (profileDirectory === undefined || target.type !== "provider_turn") return undefined;
+    const terminalTurns = providerThreadTurns.filter(
+      (turn) => turn.nativeTurnRef !== null && TERMINAL_TURN_STATUSES.has(turn.status),
+    );
+    return yield* rollbackAntigravityConversation({
+      conversationsDir: options.path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS),
+      sessionId: nativeSessionId,
+      keepTurns: terminalTurns.filter((turn) => turn.ordinal <= target.providerTurn.ordinal).length,
+      expectedTurns: terminalTurns.length,
+      version: options.version === undefined ? undefined : yield* options.version,
+    });
+  });
+
   return {
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
@@ -199,6 +227,7 @@ export function makeAntigravityAcpAdapterFlavor(
     mcpOverHttp: true,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
+    rollbackSession,
     buildPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
       buildAntigravityPrompt({
         input: text,

@@ -78,16 +78,20 @@ describe("AntigravityAdapterV2 flavor", () => {
     // Permission prompts carry the launch; later updates for the same call do not.
     const launch = flavor.extractSubagentUpdate?.({
       toolCallId: "35bea692fa95447fbdae6333fec5515f",
-      title: "Run invoke_subagent?",
+      title: "Run invoke_subagent",
       kind: "other",
       status: "pending",
       data: {
         rawInput: {
-          Subagents: [{ TypeName: "research", Role: "Readme Reader", Prompt: "Read README.md" }],
+          TypeName: "self",
+          Role: "Readme Reader",
+          Prompt: "Read README.md",
+          Model: "flash_lite",
         },
       },
     });
     assert.equal(launch?.title, "Readme Reader");
+    assert.equal(launch?.model, "flash_lite");
     assert.equal(launch?.prompt, "Read README.md");
   });
 

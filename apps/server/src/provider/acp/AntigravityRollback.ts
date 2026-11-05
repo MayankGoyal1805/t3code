@@ -4,20 +4,19 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 /** agy versions whose private conversation storage this module was verified against. */
-export const ANTIGRAVITY_ROLLBACK_TESTED_VERSIONS: ReadonlyArray<string> = ["1.5.0", "1.5.1"];
+const ANTIGRAVITY_ROLLBACK_TESTED_VERSIONS: ReadonlyArray<string> = ["1.5.0", "1.5.1"];
 
-class AntigravityRollbackError extends Data.TaggedError("AntigravityRollbackError")<{
-  readonly cause: unknown;
-}> {}
+class AntigravityRollbackError extends Schema.TaggedError<AntigravityRollbackError>()(
+  "AntigravityRollbackError",
+  { cause: Schema.Defect() },
+) {}
 
 const USER_INPUT_STEP = 14;
 const PLANNER_STEP = 15;
-// Subagent records and child messages tie a conversation to other conversation files.
-const SUBAGENT_STEPS = [101, 132];
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const isAntigravityRollbackVersionTested = (version: string | undefined) =>
@@ -48,18 +47,6 @@ const userStepIndexes = (database: NodeSqlite.DatabaseSync) =>
 
 const scalar = (database: NodeSqlite.DatabaseSync, sql: string, ...params: Array<number>) =>
   Number(database.prepare(sql).get(...params)?.n ?? 0);
-
-/** Counts user-input turns in a conversation; undefined when it cannot be read. */
-export const countAntigravityUserTurns = Effect.fn("AntigravityRollback.countUserTurns")(
-  function* (input: { readonly conversationsDir: string; readonly sessionId: string }) {
-    const file = conversationFile(input.conversationsDir, input.sessionId);
-    return yield* Effect.try({
-      try: () =>
-        withDatabase(file, { readOnly: true }, (database) => userStepIndexes(database).length),
-      catch: (cause) => new AntigravityRollbackError({ cause }),
-    }).pipe(Effect.orElseSucceed(() => undefined));
-  },
-);
 
 const replaceBytes = (source: Uint8Array, search: Uint8Array, replacement: Uint8Array) => {
   const buffer = Buffer.from(source);
@@ -108,15 +95,20 @@ const rewriteSessionId = (database: NodeSqlite.DatabaseSync, oldId: string, newI
 };
 
 /** Truncates the copy to the first `keepTurns` user turns; false when the mapping is unsafe. */
-const truncateCopy = (database: NodeSqlite.DatabaseSync, keepTurns: number) => {
-  const hasSubagents =
-    scalar(
-      database,
-      `SELECT count(*) AS n FROM steps WHERE has_subtrajectory != 0 OR step_type IN (${SUBAGENT_STEPS.join(",")})`,
-    ) > 0 || scalar(database, "SELECT count(*) AS n FROM parent_references") > 0;
-  if (hasSubagents) return false;
+const truncateCopy = (
+  database: NodeSqlite.DatabaseSync,
+  keepTurns: number,
+  expectedTurns: number,
+) => {
+  // Subagent children are separate databases; only nested trajectories or a child copy are unsafe.
+  const isNested =
+    scalar(database, "SELECT count(*) AS n FROM steps WHERE has_subtrajectory != 0") > 0 ||
+    scalar(database, "SELECT count(*) AS n FROM parent_references") > 0;
+  if (isNested) return false;
 
   const userSteps = userStepIndexes(database);
+  // T3's terminal turns and agy's user steps must pair one-to-one, or the cut would land on the wrong turn.
+  if (userSteps.length !== expectedTurns) return false;
   const cutoff = userSteps[keepTurns];
   if (cutoff === undefined) return false;
 
@@ -162,6 +154,8 @@ export const rollbackAntigravityConversation = Effect.fn("AntigravityRollback.ro
     readonly conversationsDir: string;
     readonly sessionId: string;
     readonly keepTurns: number;
+    /** Terminal T3 turns of the thread; the conversation must hold exactly this many user turns. */
+    readonly expectedTurns: number;
     readonly version: string | undefined;
     readonly newSessionId?: string;
   }) {
@@ -188,7 +182,7 @@ export const rollbackAntigravityConversation = Effect.fn("AntigravityRollback.ro
           database.prepare("VACUUM INTO ?").run(temp);
         });
         const truncated = withDatabase(temp, {}, (database) => {
-          if (!truncateCopy(database, input.keepTurns)) return false;
+          if (!truncateCopy(database, input.keepTurns, input.expectedTurns)) return false;
           database.exec("BEGIN IMMEDIATE");
           rewriteSessionId(database, input.sessionId, newSessionId);
           database.exec("COMMIT");

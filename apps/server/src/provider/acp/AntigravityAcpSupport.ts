@@ -142,6 +142,16 @@ export function antigravityThinkingConfig(
   return option?.type === "select" ? option : undefined;
 }
 
+const BUNDLE_FLASH_MODEL = /^gemini-3\.[678]-flash-(low|medium|high)$/;
+
+/** The bundle runtime listed each thinking level as its own model; agy has one model plus `thought_level`. */
+function migrateAntigravityBundleModel(model: string | null | undefined) {
+  const level = model == null ? undefined : BUNDLE_FLASH_MODEL.exec(model)?.[1];
+  return level === undefined
+    ? { model, thoughtLevel: undefined }
+    : { model: "gemini-3.8-flash", thoughtLevel: level };
+}
+
 function resolveAntigravityModel(input: {
   readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
   readonly model: string | null | undefined;
@@ -161,21 +171,22 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
   function* <E>(input: {
     readonly runtime: Pick<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
-      "getConfigOptions" | "setModel"
+      "getConfigOptions" | "setModel" | "setConfigOption"
     >;
     readonly model: string | null | undefined;
     readonly defaultModel?: string | undefined;
     readonly mapError: (cause: EffectAcpErrors.AcpError) => E;
   }): Effect.fn.Return<string | undefined, E> {
+    const { model: requestedModel, thoughtLevel } = migrateAntigravityBundleModel(input.model);
     const configOptions = yield* input.runtime.getConfigOptions;
     const modelConfig = configOptions.find((option) => option.id === "model");
     const current = modelConfig?.type === "select" ? modelConfig.currentValue : undefined;
     const resolved = resolveAntigravityModel({
       configOptions,
-      model: input.model,
+      model: requestedModel,
       defaultModel: input.defaultModel,
     });
-    const explicit = Boolean(input.model) && input.model !== ANTIGRAVITY_DEFAULT_MODEL;
+    const explicit = Boolean(requestedModel) && requestedModel !== ANTIGRAVITY_DEFAULT_MODEL;
     if (resolved === undefined || (!explicit && resolved === current)) return current;
     const options = antigravityModelOptions(configOptions);
     if (!options.some((option) => option.value === resolved)) {
@@ -188,6 +199,19 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
       );
     }
     yield* input.runtime.setModel(resolved).pipe(Effect.mapError(input.mapError));
+    if (thoughtLevel !== undefined) {
+      // Option values are per model, so read them after the switch.
+      const thinking = antigravityThinkingConfig(yield* input.runtime.getConfigOptions);
+      if (
+        thinking !== undefined &&
+        thinking.currentValue !== thoughtLevel &&
+        thinking.options.some((entry) => "value" in entry && entry.value === thoughtLevel)
+      ) {
+        yield* input.runtime
+          .setConfigOption(thinking.id, thoughtLevel)
+          .pipe(Effect.mapError(input.mapError));
+      }
+    }
     return resolved;
   },
 );

@@ -427,6 +427,9 @@ export const AntigravityDriver: ProviderDriver<
       makeRuntime,
       withProcess: authFlow.withProcess,
       defaultModel,
+      version: provider.snapshot.getSnapshot.pipe(
+        Effect.map((snapshot) => snapshot.version ?? undefined),
+      ),
       profileDirectory: geminiDirectory,
       onSessionStarted: provider.onSessionStarted,
       onSessionEvent: (event) => {

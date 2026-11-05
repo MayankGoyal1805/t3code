@@ -49,7 +49,7 @@ const step = (type: number, metadata: Uint8Array, ...fields: number[][]): StepRo
 const callMetadata = (callId: string, name: string, args: string) =>
   proto(field(4, proto(field(1, callId), field(2, name), field(3, args))));
 
-export const userInputStep = (textValue: string) =>
+const userInputStep = (textValue: string) =>
   step(14, proto(), field(19, proto(field(2, textValue))));
 
 export const plannerStep = (input: {
@@ -133,7 +133,7 @@ export const invokeStep = (input: {
     ),
   });
 
-export const messageStep = (body: string) =>
+const messageStep = (body: string) =>
   step(
     101,
     proto(),

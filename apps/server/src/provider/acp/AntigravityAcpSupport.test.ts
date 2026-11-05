@@ -40,7 +40,15 @@ function makeModelRuntime(
     selections.push(model);
   });
   return {
-    runtime: { getConfigOptions: Effect.succeed(configOptions), setModel },
+    runtime: {
+      getConfigOptions: Effect.succeed(configOptions),
+      setModel,
+      setConfigOption: (id: string, value: string | boolean) =>
+        Effect.sync(() => {
+          selections.push(`${id}=${String(value)}`);
+          return {} as EffectAcpSchema.SetSessionConfigOptionResponse;
+        }),
+    },
     selections,
   };
 }
@@ -149,6 +157,31 @@ describe("applyAntigravityAcpModelSelection", () => {
         });
         expect(selections).toEqual([]);
       }),
+  );
+
+  it.effect("maps a bundle-era thinking-level slug to the model plus thought_level", () =>
+    Effect.gen(function* () {
+      const flash = { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" };
+      const { runtime, selections } = makeModelRuntime([
+        { ...modelConfig, options: [...modelConfig.options, flash] },
+        {
+          id: "thought_level",
+          name: "Thought level",
+          category: "thought_level",
+          type: "select",
+          currentValue: "high",
+          options: ["low", "medium", "high"].map((value) => ({ value, name: value })),
+        },
+      ]);
+      const model = yield* applyAntigravityAcpModelSelection({
+        runtime,
+        model: "gemini-3.8-flash-low",
+        mapError: (cause) => cause,
+      });
+
+      expect(model).toBe("gemini-3.8-flash");
+      expect(selections).toEqual(["gemini-3.8-flash", "thought_level=low"]);
+    }),
   );
 
   it.effect("accepts exact model IDs from grouped native options", () =>

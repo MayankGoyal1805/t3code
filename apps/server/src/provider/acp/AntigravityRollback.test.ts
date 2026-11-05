@@ -6,17 +6,14 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import {
-  countAntigravityUserTurns,
-  rollbackAntigravityConversation,
-} from "./AntigravityRollback.ts";
+import { rollbackAntigravityConversation } from "./AntigravityRollback.ts";
 
 const OLD_ID = "e6aba774-5472-4277-b6ee-27b2e05570a7";
 const NEW_ID = "11111111-2222-4333-8444-555555555555";
 const USER = 14;
 const PLANNER = 15;
-const TOOL = 8;
-const SUBAGENT = 132;
+const TOOL = 132;
+const CHILD_MESSAGE = 101;
 
 // Schema copied from an agy 1.5.1 conversation database.
 const SCHEMA = [
@@ -28,8 +25,21 @@ const SCHEMA = [
   'CREATE TABLE `trajectory_metadata_blob` (`id` text DEFAULT "main",`data` blob,PRIMARY KEY (`id`))',
 ];
 
-// Three turns; the second runs a tool between two planner responses.
-const STEP_TYPES = [USER, PLANNER, USER, PLANNER, TOOL, PLANNER, USER, PLANNER];
+// Three turns; the second runs tools (step 132, also subagent launches) and receives a child message.
+const STEP_TYPES = [
+  USER,
+  PLANNER,
+  USER,
+  PLANNER,
+  TOOL,
+  PLANNER,
+  TOOL,
+  PLANNER,
+  CHILD_MESSAGE,
+  PLANNER,
+  USER,
+  PLANNER,
+];
 const PLANNER_COUNT = STEP_TYPES.filter((type) => type === PLANNER).length;
 
 const writeConversation = (
@@ -103,6 +113,7 @@ const rollback = (
     conversationsDir: directory,
     sessionId: OLD_ID,
     keepTurns: 2,
+    expectedTurns: 3,
     version: "1.5.1",
     newSessionId: NEW_ID,
     ...overrides,
@@ -114,17 +125,13 @@ describe("rollbackAntigravityConversation", () => {
       const { directory, fs, sourceFile, newFile } = yield* setup;
       writeConversation(sourceFile);
 
-      assert.equal(
-        yield* countAntigravityUserTurns({ conversationsDir: directory, sessionId: OLD_ID }),
-        3,
-      );
       assert.deepEqual(yield* rollback(directory), { sessionId: NEW_ID });
 
       assert.deepEqual(
         readRows(newFile, "SELECT idx, step_type FROM steps ORDER BY idx").map(
           (row) => row.step_type,
         ),
-        STEP_TYPES.slice(0, 6),
+        STEP_TYPES.slice(0, 10),
       );
       assert.equal(readRows(newFile, "SELECT idx FROM gen_metadata").length, PLANNER_COUNT - 1);
       assert.equal(readRows(newFile, "SELECT idx FROM executor_metadata").length, 2);
@@ -159,6 +166,7 @@ describe("rollbackAntigravityConversation", () => {
       assert.isUndefined(yield* rollback(directory, { version: "1.4.5" }));
       assert.isUndefined(yield* rollback(directory, { keepTurns: 0 }));
       assert.isUndefined(yield* rollback(directory, { keepTurns: 3 }));
+      assert.isUndefined(yield* rollback(directory, { expectedTurns: 2 }));
       assert.isUndefined(yield* rollback(directory, { sessionId: "not-a-uuid" }));
       assert.deepEqual(
         yield* fs
@@ -170,11 +178,6 @@ describe("rollbackAntigravityConversation", () => {
       yield* fs.remove(sourceFile);
       writeConversation(sourceFile, { subtrajectoryAt: 3 });
       assert.isUndefined(yield* rollback(directory));
-      yield* fs.remove(sourceFile);
-      writeConversation(sourceFile, {
-        stepTypes: [USER, PLANNER, SUBAGENT, PLANNER, USER, PLANNER],
-      });
-      assert.isUndefined(yield* rollback(directory, { keepTurns: 1 }));
       yield* fs.remove(sourceFile);
       // Planner steps without matching generation metadata cannot be cut by position.
       writeConversation(sourceFile);

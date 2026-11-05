@@ -1,24 +1,23 @@
 # Antigravity
 
-T3 Code runs Google's official Antigravity ACP agent on your selected environment.
-It has its own sign-in, separate from the Antigravity IDE or CLI. Google controls
-which models and account access are available through this agent.
+T3 Code runs Google's Antigravity CLI (`agy`, version 1.5.0 or newer) on your selected
+environment. Google controls which models and account access are available through it.
 
 ## Set up Antigravity
 
-On web or desktop, open **Settings > Providers**, choose the environment that runs
-your project, and enable Antigravity. Install its runtime there, then choose
-**Sign in** and complete the browser sign-in. Wait for T3 Code to confirm
-account access and load models before starting a thread. Once the runtime is installed,
-you can also sign in from **Settings > Providers** in the mobile app.
+Install the Antigravity CLI on the environment that runs your project (see
+[antigravity.google](https://antigravity.google)). T3 Code does not install it. Then open **Settings >
+Providers**, choose that environment, and enable Antigravity. Choose **Sign in** and complete the
+browser sign-in, or run `agy` in a terminal on the environment and sign in there. Wait for T3 Code
+to confirm account access and load models before starting a thread. You can also sign in from
+**Settings > Providers** in the mobile app.
 
-Installation continues if you leave settings or reconnect. Setup requires
-permission to operate the environment; update an older server if it does not offer
-Antigravity setup.
+If T3 Code cannot find `agy`, set **Binary path** in the provider settings. Setup requires
+permission to operate the environment.
 
 ### Sign in from a remote device
 
-Google returns to a `127.0.0.1` address. It can finish directly when your browser is
+Google returns to a `localhost` address. It can finish directly when your browser is
 on the environment's machine. From another device, the final page will usually
 fail to load because the sign-in listener is on the environment.
 
@@ -44,97 +43,74 @@ Choose **Sign-in method** in the Antigravity provider settings:
 | Agent Platform / Vertex AI | API key, or GCP project and location with Application Default Credentials on the environment |
 
 The environment stores the Antigravity API key outside its settings file, and
-clients only see whether one is saved. The agent uses the method and credentials selected for this instance;
-ambient `GEMINI_API_KEY` and Google credential variables do not override them.
+clients only see whether one is saved. The agent uses the method and credentials selected for this instance; with
+Gemini API key, the saved key is passed to `agy` as `GEMINI_API_KEY`.
 Changing the method stops the instance's sessions. Sign out before replacing an
 account.
 
-## Runtime installation
-
-Managed installation supports Apple Silicon macOS, Linux x64 or ARM64, and Windows
-x64 or ARM64. Intel Macs can connect to a supported remote environment. Allow
-several GB of free disk space, especially on Linux.
-
-### Use a manual installation
-
-Download the archive for your environment from the [official ACP Registry][registry].
-Extract the ACP executable and its `localharness_external` helper into the same
-directory, at the same version. Make both executable on macOS or Linux; Windows
-uses `.exe` files.
-
-Set **Binary path** to the ACP executable on the environment and update it yourself.
-Leave the field blank to use the managed runtime, or a compatible executable on
-`PATH` if no managed runtime is installed.
-
 ## Models and threads
 
-The model list comes from your Antigravity account, including Claude and GPT models
-when your plan has them. Pick a thinking level beside the model list in the model picker; it
-shows only the levels the selected model supports. A resumed thread keeps its
-selected model. If access to that model ends, select another available model
-before continuing.
+The model list comes from your Antigravity account: Gemini 4 Argon and Gemini 3.8 Flash, plus
+Claude and GPT models when your account offers them. Pick a thinking level beside the model list
+in the model picker; it shows only the levels the selected model supports. A resumed thread keeps
+its selected model. If access to that model ends, select another available model before continuing.
 
-Antigravity creates empty `.gemini/skills` and `.agents/skills` folders in the
-workspace when a session starts. Git does not track empty folders, so they never
-appear in commits.
+Use Antigravity's native `/plan` command for planning. T3 Code's separate Plan mode is
+unavailable. Tool approvals follow [Permission modes](./permission-modes.md). Questions with fixed
+choices still need one of the offered answers, even in **Full access**.
 
-Use Antigravity's native `/plan` command for planning. T3 Code's separate Plan mode
-is unavailable. Tool approvals follow [Permission modes](./permission-modes.md).
-Questions with fixed choices still need one of the offered answers, even in
-**Full access**.
+Reverting a turn restores your files and rewinds Antigravity's conversation, so later turns do not
+remember what you reverted. This works on `agy` versions T3 Code has tested. On other versions the
+files are still restored, but the next turn starts a fresh agent session without the earlier
+conversation.
 
-T3 Code keeps conversation history and file diffs, but Antigravity cannot rewind
-its conversation. Reverting a thread or editing and resubmitting an earlier turn
-is unavailable. Continue with a follow-up message or start a new thread.
+Manual context compaction is unavailable through Antigravity's ACP mode, even though its CLI has
+`/compact`. Start a new thread when you need a fresh context.
 
-Manual context compaction is unavailable through Antigravity's ACP runtime, even
-though its CLI has `/compact`. Start a new thread when you need a fresh context.
+Antigravity creates empty `.gemini/skills` and `.agents/skills` folders in the workspace when a
+session starts. Git does not track empty folders, so they never appear in commits.
 
 ### Skills and attachments
 
-Put project skills in `.agents/skills`. T3 Code also reads `.gemini/skills` and the
-legacy `.agent/skills` directory. Among these project locations, the first copy
-wins in this order: `.gemini/skills`, `.agents/skills`, `.agent/skills`. See
+Put project skills in `.agents/skills`. T3 Code also reads `.gemini/skills` and the legacy
+`.agent/skills` directory. Among these project locations, the first copy wins in this order:
+`.gemini/skills`, `.agents/skills`, `.agent/skills`. See
 [commands and skills](./composer.md#commands-and-skills) for invoking them.
 
-Skills for every project go in `~/.gemini/config/skills` or
-`~/.gemini/antigravity-cli/skills`. Antigravity does not read `~/.agents/skills`,
-so a skill there only appears when the project itself is your home directory.
+Skills for every project go in `~/.gemini/config/skills` or `~/.gemini/antigravity-cli/skills`.
+Antigravity does not read `~/.agents/skills`, so a skill there only appears when the project itself
+is your home directory.
 
-Antigravity receives images and audio directly, and reads PDFs and text files as
-documents. With the managed runtime on macOS and Linux, an MP4 video up to 20 MiB
-is sent as video to Gemini models. Other attachments, and videos for other models, are passed as a
-saved file path for the agent to inspect with its tools.
+Antigravity reads attached files, including images, directly from disk.
 
 ### Subagents
 
-Antigravity groups subagent activity into batches. Open a batch and select
-**Subagent work** (**Work** on mobile) to read each child's role, prompt, and recent steps. This view
-is read only: you cannot message or control individual subagents, and an idle
-batch does not confirm that every child succeeded. If Antigravity did not record
-which children a batch started, the view says so. See
-[agent work](./thread-sidebar.md#inspect-agent-work) for where to inspect
-activity.
+Antigravity groups subagent activity into batches. Open a batch and select **Subagent work**
+(**Work** on mobile) to read each child's role, prompt, and recent steps. This view is read only:
+you cannot message or control individual subagents, and an idle batch does not confirm that every
+child succeeded. If Antigravity did not record which children a batch started, the view says so.
+See [agent work](./thread-sidebar.md#inspect-agent-work) for where to inspect activity.
 
-## Accounts and removal
+## Accounts and updates
 
-Add an Antigravity provider instance for each Google account in
-**Settings > Providers** on web or desktop. Each has its own sign-in; downloaded
-runtimes are shared on the environment.
+By default Antigravity shares its sign-in and conversations with the `agy` CLI in `~/.gemini`.
+Signing out in T3 Code then signs the CLI out too.
 
-| Action                    | Effect                                                            |
-| ------------------------- | ----------------------------------------------------------------- |
-| Disable                   | Stops the instance's sessions and keeps its Google sign-in.       |
-| Sign out                  | Stops the instance's sessions and removes its saved Google login. |
-| Remove downloaded runtime | Removes the shared installation and keeps Google credentials.     |
+To use another Google account, add an Antigravity provider instance in **Settings > Providers** on
+web or desktop and set its **Gemini directory** to a folder inside your home directory, for example
+`~/.gemini-work`. That instance has its own sign-in and conversations.
 
-All three keep thread history and workspace files. Sending `/logout` by itself in
-a thread signs out its instance, including stopping that instance's other sessions.
-Sign out, then sign in again to replace an account.
+| Action   | Effect                                                            |
+| -------- | ----------------------------------------------------------------- |
+| Disable  | Stops the instance's sessions and keeps its Google sign-in.       |
+| Sign out | Stops the instance's sessions and removes its saved Google login. |
 
-Before removing a managed runtime, disable its instances and cancel any active
-installation. Clear any explicit binary path pointing into that runtime. Removal
-is refused while the runtime is in use.
+Both keep thread history and workspace files. Sending `/logout` by itself in a thread signs out
+its instance, including stopping that instance's other sessions. Sign out, then sign in again to
+replace an account.
+
+When a newer `agy` is available, **Update now** on the provider card runs `agy update`. You can
+also run it yourself in a terminal.
 
 ## Check access and troubleshoot
 
@@ -149,9 +125,11 @@ To check access and reload models, use **Refresh provider status** in web or des
 provider settings, or **Refresh models** in mobile thread settings. If asked to
 sign in again, use provider settings on web or desktop, or **Settings > Providers** on mobile.
 
+Threads started before Antigravity moved to the `agy` CLI may not continue their earlier agent
+conversation and may need a new thread.
+
 If Google reports `SUBSCRIPTION_REQUIRED`, an account restriction, or a usage limit,
 follow the provider's message and any retry time. See [Google's account plans][plans]
 for eligibility.
 
-[registry]: https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json
 [plans]: https://antigravity.google/docs/plans
