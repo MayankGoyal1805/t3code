@@ -46,7 +46,7 @@ const initializeResult = {
   agentInfo: {
     name: "antigravity-acp",
     title: "Google Antigravity",
-    version: "agy_acp_server_20260818_01_RC01",
+    version: "1.5.1",
   },
 } satisfies EffectAcpSchema.InitializeResponse;
 
@@ -301,7 +301,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           status: "disabled",
           auth: { status: "unknown" },
           models: [],
-          setup: { canAuthenticate: true, canInstall: true },
+          setup: { canAuthenticate: true, canInstall: false },
           showInteractionModeToggle: false,
           supportsConversationRollback: false,
           supportsTextGeneration: false,
@@ -334,7 +334,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           expect(snapshot).toMatchObject({
             installed: true,
             status: "warning",
-            version: "agy_acp_server_20260818_01_RC01",
+            version: "1.5.1",
             auth: { status: "unknown", ...(auth ? { type: auth.type } : {}) },
             message:
               auth?.type === "gemini-api-key" || auth?.type === "agent-platform"

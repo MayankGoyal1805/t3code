@@ -163,7 +163,9 @@ interface AntigravityProviderOptions {
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
   readonly clearUsage?: Effect.Effect<void>;
-  readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
+  readonly resolveMaintenance?: (options?: {
+    readonly fresh?: boolean;
+  }) => Effect.Effect<ProviderMaintenanceCapabilities>;
   readonly auth?: { readonly type: string; readonly label: string };
 }
 
@@ -201,7 +203,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           : "Antigravity is disabled in T3 Code settings.",
       },
     }),
-    setup: { canAuthenticate: true, canInstall: true },
+    setup: { canAuthenticate: true, canInstall: false },
     supportsConversationRollback: false,
     supportsTextGeneration: false,
     workspaceSnapshots: [],
@@ -286,7 +288,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         : failure?._tag === "ProviderSetupError"
           ? failure.detail.trim() || "Antigravity could not complete its local health check."
           : missingInstallation
-            ? "Antigravity ACP runtime is not installed or its executable could not be found."
+            ? "The Antigravity CLI (agy) is not installed or could not be found."
             : failure
               ? "Antigravity could not complete its local health check."
               : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
@@ -337,14 +339,16 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     return yield* options.stampIdentity(next.draft);
   });
 
-  const maintenanceCapabilities =
-    options.maintenanceCapabilities ??
-    makeManualOnlyProviderMaintenanceCapabilities({
-      provider: ProviderDriverKind.make("antigravity"),
-      packageName: null,
-    });
   const managed = yield* makeManagedServerProvider({
-    resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+    resolveMaintenance:
+      options.resolveMaintenance ??
+      (() =>
+        Effect.succeed(
+          makeManualOnlyProviderMaintenanceCapabilities({
+            provider: ProviderDriverKind.make("antigravity"),
+            packageName: null,
+          }),
+        )),
     getSettings: Effect.succeed(settings),
     streamSettings: Stream.empty,
     haveSettingsChanged: () => false,

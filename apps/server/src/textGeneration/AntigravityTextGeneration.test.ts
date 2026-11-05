@@ -13,7 +13,6 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
-import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { type AcpError, AcpRequestError } from "effect-acp/errors";
@@ -21,7 +20,6 @@ import type * as AcpSchema from "effect-acp/compat";
 import { expect } from "vite-plus/test";
 
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
-import { removeAntigravitySessionFiles } from "../provider/acp/AntigravitySessionFiles.ts";
 
 import {
   type AntigravityTextGenerationOptions,
@@ -37,9 +35,6 @@ const modelSelection = {
   instanceId: ProviderInstanceId.make("antigravity-test"),
   model: "gemini-test",
 };
-const encodeMetadata = Schema.encodeEffect(
-  Schema.fromJsonString(Schema.Struct({ cwd: Schema.String })),
-);
 
 interface PromptContext {
   readonly emit: (
@@ -69,10 +64,10 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-text-test-" });
   const profileDirectory = path.join(root, "profile");
   const projectDirectory = path.join(root, "project");
-  const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+  const conversations = path.join(profileDirectory, "antigravity-cli", "conversations");
   const nativeSessionId = options.sessionId ?? SESSION_ID;
   const sessionBase = path.join(conversations, SESSION_ID);
-  const brainDirectory = path.join(profileDirectory, "antigravity-acp", "brain", SESSION_ID);
+  const brainDirectory = path.join(profileDirectory, "antigravity-cli", "brain", SESSION_ID);
   yield* fs.makeDirectory(projectDirectory, { recursive: true });
   yield* fs.makeDirectory(conversations, { recursive: true });
   yield* fs.writeFileString(path.join(projectDirectory, "keep.txt"), "untouched");
@@ -147,8 +142,6 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
             yield* fs.makeDirectory(brainDirectory, { recursive: true }).pipe(Effect.orDie);
             yield* fs.writeFileString(`${sessionBase}.db`, "helper session").pipe(Effect.orDie);
             yield* fs.writeFileString(`${sessionBase}.db-wal`, "helper journal").pipe(Effect.orDie);
-            const metadata = yield* encodeMetadata({ cwd }).pipe(Effect.orDie);
-            yield* fs.writeFileString(`${sessionBase}.meta`, metadata).pipe(Effect.orDie);
             yield* fs
               .writeFileString(path.join(brainDirectory, "output.txt"), "helper artifact")
               .pipe(Effect.orDie);
@@ -264,7 +257,6 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
     }
     expect(yield* fs.exists(`${sessionBase}.db`)).toBe(false);
     expect(yield* fs.exists(`${sessionBase}.db-wal`)).toBe(false);
-    expect(yield* fs.exists(`${sessionBase}.meta`)).toBe(false);
     expect(yield* fs.exists(brainDirectory)).toBe(false);
     expect(yield* fs.readFileString(path.join(projectDirectory, "keep.txt"))).toBe("untouched");
     expect(yield* fs.readFileString(path.join(conversations, "user-session.db"))).toBe(
@@ -609,24 +601,6 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
       expect(fixture.state.prompts).toEqual([]);
       expect(yield* fixture.fs.readFileString(`${fixture.sessionBase}.db`)).toBe("helper session");
       expect(fixture.state.closed).toEqual(fixture.state.workspaces);
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("keeps native sessions whose metadata belongs to a different workspace", () =>
-    Effect.gen(function* () {
-      const fixture = yield* makeFixture();
-      yield* fixture.fs.writeFileString(`${fixture.sessionBase}.db`, "keep this session");
-      const metadata = yield* encodeMetadata({ cwd: fixture.projectDirectory });
-      yield* fixture.fs.writeFileString(`${fixture.sessionBase}.meta`, metadata);
-      yield* removeAntigravitySessionFiles({
-        profileDirectory: fixture.profileDirectory,
-        sessionId: SESSION_ID,
-        cwd: "different-temporary-workspace",
-      });
-      expect(yield* fixture.fs.readFileString(`${fixture.sessionBase}.db`)).toBe(
-        "keep this session",
-      );
-      expect(yield* fixture.fs.readFileString(`${fixture.sessionBase}.meta`)).toBe(metadata);
     }).pipe(Effect.scoped),
   );
 });

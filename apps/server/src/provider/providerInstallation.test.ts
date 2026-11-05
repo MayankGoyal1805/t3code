@@ -14,14 +14,13 @@ import * as Stream from "effect/Stream";
 
 import * as ServerSettings from "../serverSettings.ts";
 import * as CodexInstallation from "./CodexInstallation.ts";
-import * as AntigravityInstallation from "./AntigravityInstallation.ts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import { makeProviderInstallation } from "./providerInstallation.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "./ProviderRegistry.ts";
 
-const instanceId = ProviderInstanceId.make("antigravity");
-const driver = ProviderDriverKind.make("antigravity");
+const instanceId = ProviderInstanceId.make("codex");
+const driver = ProviderDriverKind.make("codex");
 const state: ProviderInstallState = {
   driver,
   operationId: null,
@@ -97,25 +96,6 @@ const makeHarness = Effect.fn("providerInstallation.test.makeHarness")(function*
               calls.push("codex-remove");
             }),
         }),
-        Layer.mock(AntigravityInstallation.AntigravityInstallation)({
-          managedDirectory: "/unused-managed-runtime",
-          start: Effect.sync(() => {
-            calls.push("start");
-            return state;
-          }),
-          cancel: () =>
-            Effect.sync(() => {
-              calls.push("cancel");
-              return state;
-            }),
-          state: Effect.succeed(state),
-          changes: Stream.succeed(state),
-          remove: (paths) =>
-            Effect.sync(() => {
-              protectedPaths = paths ?? [];
-              calls.push("remove");
-            }),
-        }),
       ),
     ),
   );
@@ -128,9 +108,9 @@ describe("provider installation routing", () => {
       const harness = yield* makeHarness({
         settings: {
           providerInstances: {
-            [ProviderInstanceId.make("antigravity")]: {
-              driver: ProviderDriverKind.make("antigravity"),
-              config: { binaryPath: "/external/agy" },
+            [instanceId]: {
+              driver,
+              config: { setupMode: "managed", binaryPath: "/external/codex" },
             },
           },
         },
@@ -151,17 +131,18 @@ describe("provider installation routing", () => {
       const path = yield* Path.Path;
       const platform = yield* HostProcess.Platform;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-install-route-" });
-      const binary = platform === "win32" ? "agy-test.exe" : "agy-test";
+      const binary = platform === "win32" ? "codex-test.exe" : "codex-test";
       const executable = path.join(directory, binary);
       yield* fs.writeFileString(executable, "test");
       yield* fs.chmod(executable, 0o755);
-      const other = ProviderInstanceId.make("antigravity-work");
+      const other = ProviderInstanceId.make("codex-work");
       const harness = yield* makeHarness({
         settings: {
           providerInstances: {
+            [instanceId]: { driver, config: { setupMode: "managed" } },
             [other]: {
               driver,
-              config: { binaryPath: binary },
+              config: { setupMode: "managed", binaryPath: binary },
               environment: [{ name: "PATH", value: directory, sensitive: false }],
             },
           },
@@ -169,7 +150,7 @@ describe("provider installation routing", () => {
       });
       yield* harness.router.remove({ instanceId });
       assert.include(harness.protectedPaths(), executable);
-      assert.deepEqual(harness.calls, ["remove", "refresh"]);
+      assert.deepEqual(harness.calls, ["codex-remove", "refresh"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

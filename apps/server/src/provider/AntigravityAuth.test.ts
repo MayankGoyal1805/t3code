@@ -25,8 +25,8 @@ const instanceId = ProviderInstanceId.make("antigravity-auth-test");
 const owner = "t3-auth-session-owner";
 const otherOwner = "t3-auth-session-other";
 const authorizationUrl =
-  "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2F&state=test-state";
-const callbackUrl = "http://127.0.0.1:51234/?state=test-state&code=test-code";
+  "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A51234%2Fauth%2Fcallback&state=test-state";
+const callbackUrl = "http://localhost:51234/auth/callback?state=test-state&code=test-code";
 
 const initialized = {
   protocolVersion: 1,
@@ -352,7 +352,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       for (const invalidUrl of [
         callbackUrl.replace("51234", "51235"),
         callbackUrl.replace("test-state", "wrong-state"),
-        callbackUrl.replace("/?", "/other?"),
+        callbackUrl.replace("/auth/callback?", "/other?"),
         `${callbackUrl}&state=test-state`,
       ]) {
         const result = yield* harness.auth.controller

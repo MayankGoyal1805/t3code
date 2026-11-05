@@ -11,13 +11,16 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
+import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "./AntigravityChildWork.ts";
+import { message, text } from "./AntigravityProto.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
 
 // CORTEX_STEP_TYPE_ERROR_MESSAGE in the native trajectory.
 const ERROR_STEP_TYPE = 17;
-// The harness error text leads the payload; a Go stack trace follows it.
-const MAX_ERROR_PAYLOAD_BYTES = 16_384;
-// The Go harness's rendering of a Google API error, as the agent's api_errors.py reads it.
+// An error step carries the message plus a Go stack trace; a larger one is read as a bare failure.
+const MAX_ERROR_PAYLOAD_BYTES = 256 * 1024;
+const MAX_ERROR_MESSAGE_CHARS = 500;
+// The Go harness's rendering of a Google API error.
 const API_ERROR = /Error (\d{3}), Message: (.+?), Status: ([A-Z_]+)/s;
 const QUOTA_EXHAUSTED = /\breason:QUOTA_EXHAUSTED\b/;
 const RESET_TIMESTAMP = /\bquotaResetTimeStamp:([^\s\]]+)/;
@@ -39,7 +42,21 @@ const NATIVE_SESSION_ID = /^[\w-]+$/;
 
 interface LastStep {
   readonly type: number;
-  readonly payload: Uint8Array | null;
+  /** Error step {24: {3: {1 title, 2 detail, 3 detail with Go stack, 9 detail}}}. */
+  readonly error:
+    | { readonly title: string; readonly detail: string; readonly full: string }
+    | undefined;
+}
+
+function decodeError(payload: Uint8Array | null): LastStep["error"] {
+  if (payload === null) return undefined;
+  try {
+    const error = message(message(payload, 24), 3);
+    const detail = text(error, 9) ?? text(error, 2) ?? "";
+    return { title: text(error, 1) ?? "", detail, full: text(error, 3) ?? detail };
+  } catch {
+    return undefined;
+  }
 }
 
 class AntigravitySessionLogError extends Schema.TaggedError<AntigravitySessionLogError>()(
@@ -81,19 +98,23 @@ const lastStepAfter =
   (database: NodeSqlite.DatabaseSync): LastStep | undefined => {
     const row = database
       .prepare(
-        `SELECT step_type AS type, substr(step_payload, 1, ?) AS payload
+        `SELECT step_type AS type,
+                CASE WHEN step_type = ? AND length(step_payload) <= ? THEN step_payload END AS payload
          FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1`,
       )
-      .get(MAX_ERROR_PAYLOAD_BYTES, index);
+      .get(ERROR_STEP_TYPE, MAX_ERROR_PAYLOAD_BYTES, index);
     if (typeof row?.type !== "number") return undefined;
-    return { type: row.type, payload: row.payload instanceof Uint8Array ? row.payload : null };
+    return {
+      type: row.type,
+      error: decodeError(row.payload instanceof Uint8Array ? row.payload : null),
+    };
   };
 
-function resetAtFrom(text: string, now: DateTime.Utc): string | undefined {
+function resetAtFrom(errorText: string, now: DateTime.Utc): string | undefined {
   // makeProviderFailure drops a timestamp that does not parse, so fall back to the delay.
-  const timestamp = RESET_TIMESTAMP.exec(text)?.[1];
+  const timestamp = RESET_TIMESTAMP.exec(errorText)?.[1];
   if (timestamp !== undefined && Option.isSome(DateTime.make(timestamp))) return timestamp;
-  const delay = RESET_DELAY.exec(text)?.[1] ?? RETRY_DELAY.exec(text)?.[1];
+  const delay = RESET_DELAY.exec(errorText)?.[1] ?? RETRY_DELAY.exec(errorText)?.[1];
   if (delay === undefined) return undefined;
   let delayMs = 0;
   for (const [, amount, unit] of delay.matchAll(GO_DURATION_PART)) {
@@ -107,41 +128,39 @@ function turnFailure(
   step: LastStep | undefined,
   now: DateTime.Utc,
 ): OrchestrationV2ProviderFailure | undefined {
-  const errorText =
-    step?.type === ERROR_STEP_TYPE
-      ? new TextDecoder().decode(step.payload ?? new Uint8Array())
-      : undefined;
+  const isError = step?.type === ERROR_STEP_TYPE;
   // The agent maps only the SDK's QUOTA_EXHAUSTED stop reason to `refusal`.
-  if (errorText === undefined && stopReason !== "refusal") return undefined;
-  const text = errorText ?? "";
-  const apiError = API_ERROR.exec(text);
-  if (stopReason === "refusal" || QUOTA_EXHAUSTED.test(text)) {
+  if (!isError && stopReason !== "refusal") return undefined;
+  const { title, detail, full } = step?.error ?? { title: "", detail: "", full: "" };
+  const searchable = `${detail}\n${full}`;
+  const apiError = API_ERROR.exec(searchable);
+  if (stopReason === "refusal" || QUOTA_EXHAUSTED.test(searchable)) {
     return makeProviderFailure({
       class: "usage_limit",
       message: "You have reached your Antigravity quota for this period.",
       code: apiError?.[3] ?? "QUOTA_EXHAUSTED",
       retryable: true,
-      resetAt: resetAtFrom(text, now) ?? null,
+      resetAt: resetAtFrom(searchable, now) ?? null,
     });
   }
   if (apiError === null) {
+    // Only the first line: the rest is a Go stack trace.
+    const firstLine = (detail || title).split("\n", 1)[0]!.trim().slice(0, MAX_ERROR_MESSAGE_CHARS);
     return makeProviderFailure({
       class: "provider_error",
-      message: "Antigravity stopped this turn because of an error.",
+      message: firstLine || "Antigravity stopped this turn because of an error.",
     });
   }
-  const [, httpStatus, message, status] = apiError;
+  const [, httpStatus, apiMessage, status] = apiError;
   const rateLimited = httpStatus === "429" || status === "RESOURCE_EXHAUSTED";
   return makeProviderFailure({
     class: rateLimited ? "usage_limit" : "provider_error",
-    message: message!.trim(),
+    message: apiMessage!.trim(),
     code: status ?? null,
     retryable: rateLimited || Number(httpStatus) >= 500,
-    resetAt: resetAtFrom(text, now) ?? null,
+    resetAt: resetAtFrom(searchable, now) ?? null,
   });
 }
-
-const conversationSegments = ["antigravity-acp", "conversations"];
 
 /**
  * Antigravity reports an upstream API failure as a chat message and `end_turn`. Its
@@ -156,12 +175,15 @@ export const watchAntigravityPromptOutcome = Effect.fn("AntigravityTurnOutcome.w
   const typedOnly = (result: EffectAcpSchema.PromptResponse) =>
     DateTime.now.pipe(Effect.map((now) => turnFailure(result.stopReason, undefined, now)));
   if (!NATIVE_SESSION_ID.test(sessionId)) return typedOnly;
-  const segments = [...conversationSegments, `${sessionId}.db`];
+  const segments = [...ANTIGRAVITY_CONVERSATION_SEGMENTS, `${sessionId}.db`];
   const before = yield* Effect.tryPromise({
     try: async () => {
       const root = await antigravityProfileRoot(profileDirectory);
       if (root === undefined) return undefined;
-      if ((await antigravityManagedPath(root, conversationSegments, "directory")) === undefined) {
+      if (
+        (await antigravityManagedPath(root, ANTIGRAVITY_CONVERSATION_SEGMENTS, "directory")) ===
+        undefined
+      ) {
         return undefined;
       }
       const database = await antigravityManagedPath(root, segments, "file");

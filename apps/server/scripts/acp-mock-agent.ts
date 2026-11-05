@@ -18,6 +18,7 @@ import { beginAcpMockPrompt } from "./acpMockCancellationState.ts";
 
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
+const antigravitySystemPromptAppend = process.env.T3_ACP_ANTIGRAVITY_SYSTEM_PROMPT_APPEND === "1";
 // GitHub Copilot CLI advertises URL-shaped session mode ids.
 const copilotModesProfile = process.env.T3_ACP_COPILOT_MODES === "1";
 const copilotModeId = (name: string) =>
@@ -337,8 +338,8 @@ const antigravityModels = [
 const availableModes: ReadonlyArray<AcpCompat.SessionMode> = antigravityProfile
   ? [
       { id: "default", name: "Default" },
-      { id: "auto_edit", name: "Auto edit" },
-      { id: "yolo", name: "YOLO" },
+      { id: "accept-edits", name: "Accept edits" },
+      { id: "plan", name: "Plan" },
     ]
   : copilotModesProfile
     ? [
@@ -531,6 +532,9 @@ const program = Effect.gen(function* () {
               : {}),
           },
           ...(supportsV2Management ? { providers: {} } : {}),
+          ...(antigravitySystemPromptAppend
+            ? { _meta: { antigravity: { systemPrompt: { append: true } } } }
+            : {}),
         },
         ...(initializeAuthMethodId
           ? {

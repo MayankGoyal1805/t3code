@@ -31,10 +31,7 @@ import {
 import type { ProviderAuthController } from "./ProviderAuthService.ts";
 
 const AUTH_TIMEOUT_MS = 300_000;
-// Once initialized, a healthy agent shows the Google link or finishes within seconds. Its bundled
-// Python has no IPv4 fallback race, so a host with broken IPv6 waits about two minutes per Google
-// request. The hint is timed from initialize, not spawn: the one-file runtime unpacks itself on
-// every launch, which can take about a minute on Windows before it answers at all.
+// Once initialized, a healthy agent shows the Google link or finishes within seconds.
 const NO_RESPONSE_HINT_MS = 30_000;
 const NO_RESPONSE_MESSAGE =
   "Antigravity has not reached Google after 30 seconds. Check this machine's network connection. Broken IPv6 is a common cause.";

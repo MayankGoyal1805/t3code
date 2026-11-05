@@ -19,11 +19,6 @@ import { HttpClient } from "effect/http";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
-import * as AntigravityInstallation from "../AntigravityInstallation.ts";
-import {
-  ANTIGRAVITY_AUTH_STDOUT_PREFIX,
-  resolveAntigravityInstanceDirectories,
-} from "../antigravityAuthSupport.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ModelManifest from "../ModelManifest.ts";
@@ -42,23 +37,19 @@ const decodeRequest = Schema.decodeEffect(
     }),
   ),
 );
-const blockedCredentialKeys = new Set([
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
-  "GOOGLE_APPLICATION_CREDENTIALS",
-  "GOOGLE_GENAI_USE_VERTEXAI",
-]);
-
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
-  options: { readonly config?: Partial<AntigravitySettings>; readonly enabled?: boolean } = {},
+  options: {
+    readonly config?: Partial<AntigravitySettings>;
+    readonly enabled?: boolean;
+    readonly signedOut?: boolean;
+  } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const config = yield* ServerConfig.ServerConfig;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const nodePath = yield* HostProcess.ExecutablePath;
   const baseEnv = yield* HostProcess.Environment;
@@ -68,118 +59,45 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
   );
   const requestLog = path.join(root, "requests.jsonl");
-  const directories = yield* resolveAntigravityInstanceDirectories(config.stateDir, instanceId);
-  const profileDirectory = directories.profile;
-  const instancePath = `${path.join(root, "instance-bin")}:${baseEnv.PATH ?? ""}`;
 
-  const makeExecutable = Effect.fn("AntigravityDriverTest.makeExecutable")(function* (
-    name: string,
-    loginRequired = false,
-  ) {
-    const directory = path.join(root, name);
-    const executablePath = path.join(directory, "agy_acp_server.par");
-    const harnessPath = path.join(directory, "localharness_external");
-    yield* fs.makeDirectory(directory, { recursive: true });
-    const authorizationUrl =
-      "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2F&state=fixture-state";
-    yield* fs.writeFileString(
-      executablePath,
-      [
-        "#!/bin/sh",
-        ...(loginRequired
-          ? [`printf '%s\\n' ${shellQuote(ANTIGRAVITY_AUTH_STDOUT_PREFIX + authorizationUrl)}`]
-          : []),
-        `exec ${shellQuote(nodePath)} ${shellQuote(mockAgentPath)} "$@"`,
-        "",
-      ].join("\n"),
-    );
-    yield* fs.writeFileString(harnessPath, "#!/bin/sh\nexit 99\n");
-    yield* fs.chmod(executablePath, 0o755);
-    yield* fs.chmod(harnessPath, 0o755);
-    return {
-      executablePath,
-      harnessPath,
-      source: "managed",
-      version: name,
-      managedVersionDirectory: directory,
-    } satisfies AntigravityInstallation.AntigravityExecutable;
-  });
+  // Stands in for `agy`: answers --version and otherwise serves ACP like the mock agent.
+  const executablePath = path.join(root, "agy");
+  yield* fs.writeFileString(
+    executablePath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo "1.5.1"; exit 0; fi',
+      ...(options.signedOut === true ? ["export T3_ACP_REQUIRE_AUTH=1"] : []),
+      `exec ${shellQuote(nodePath)} ${shellQuote(mockAgentPath)} "$@"`,
+      "",
+    ].join("\n"),
+  );
+  yield* fs.chmod(executablePath, 0o755);
 
-  const first = yield* makeExecutable("runtime 'one");
-  const second = yield* makeExecutable("runtime two");
-  const signedOut = yield* makeExecutable("runtime signed-out", true);
-  const controls = { selected: first, failResolution: false, beforeAcquire: Effect.void };
-  const acquisitions: Array<{ binaryPath: string | undefined; path: string | undefined }> = [];
-  const releases: Array<string | null> = [];
   const launches: Array<{
     command: string;
     args: ReadonlyArray<string>;
-    cwd: string | undefined;
     extendEnv: boolean | undefined;
-    profileDirectory: string | undefined;
-    harnessPath: string | undefined;
-    forceFileStorage: string | undefined;
-    credentialKeys: ReadonlyArray<string>;
-    geminiApiKey: string | undefined;
-    tempDirectory: string | undefined;
+    environment: Record<string, string | undefined>;
+    cwd: string | undefined;
     handle: ChildProcessSpawner.ChildProcessHandle;
   }> = [];
-
-  const layerInstallation = Layer.mock(AntigravityInstallation.AntigravityInstallation)({
-    managedDirectory: root,
-    resolve: () =>
-      Effect.gen(function* () {
-        if (controls.failResolution) {
-          return yield* new AntigravityInstallation.AntigravityInstallationError({
-            operation: "resolve",
-            detail: "Fixture resolution failed.",
-          });
-        }
-        return controls.selected;
-      }),
-    acquire: (binaryPath, environment) =>
-      Effect.gen(function* () {
-        acquisitions.push({ binaryPath, path: environment?.PATH });
-        yield* controls.beforeAcquire;
-        if (controls.failResolution) {
-          return yield* new AntigravityInstallation.AntigravityInstallationError({
-            operation: "resolve",
-            detail: "Fixture resolution failed.",
-          });
-        }
-        const selected = controls.selected;
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            releases.push(selected.version);
-          }),
-        );
-        return selected;
-      }),
-  });
   const observedSpawner = ChildProcessSpawner.make((command) =>
     Effect.gen(function* () {
       if (command._tag !== "StandardCommand")
         return yield* Effect.die("Unexpected process pipeline.");
       const handle = yield* spawner.spawn(command);
-      const environment = command.options.env ?? {};
-      const env = (name: string) => {
-        const value = environment[name];
-        return Redacted.isRedacted(value) ? Redacted.value(value) : value;
-      };
       launches.push({
         command: command.command,
         args: command.args.map(String),
-        cwd: command.options.cwd,
         extendEnv: command.options.extendEnv,
-        profileDirectory: env("GEMINI_HOME"),
-        harnessPath: env("ANTIGRAVITY_HARNESS_PATH"),
-        forceFileStorage: env("AGY_ACP_FORCE_FILE_STORAGE"),
-        credentialKeys: Object.keys(environment).filter((key) =>
-          blockedCredentialKeys.has(key.toUpperCase()),
+        environment: Object.fromEntries(
+          Object.entries(command.options.env ?? {}).map(([key, value]) => [
+            key,
+            Redacted.isRedacted(value) ? Redacted.value(value) : value,
+          ]),
         ),
-        geminiApiKey: env("GEMINI_API_KEY"),
-        tempDirectory:
-          environment.ANTIGRAVITY_HARNESS_PATH === undefined ? undefined : env("TMPDIR"),
+        cwd: command.options.cwd,
         handle,
       });
       return handle;
@@ -189,23 +107,19 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     instanceId,
     displayName: "Google test account",
     enabled: options.enabled ?? true,
-    config: { ...AntigravityDriver.defaultConfig(), ...options.config },
+    config: {
+      ...AntigravityDriver.defaultConfig(),
+      binaryPath: executablePath,
+      ...options.config,
+    },
     environment: [
-      { name: "PATH", value: instancePath },
+      { name: "PATH", value: baseEnv.PATH ?? "" },
       { name: "T3_ACP_ANTIGRAVITY", value: "1" },
       { name: "T3_ACP_REQUEST_LOG_PATH", value: requestLog },
-      { name: "GEMINI_API_KEY", value: "must-not-be-used" },
-      { name: "google_api_key", value: "must-not-be-used" },
-      { name: "GOOGLE_APPLICATION_CREDENTIALS", value: "/must-not-be-used.json" },
-      { name: "GOOGLE_GENAI_USE_VERTEXAI", value: "true" },
-      { name: "GEMINI_HOME", value: "/must-not-be-used" },
-      { name: "ANTIGRAVITY_HARNESS_PATH", value: "/must-not-be-used" },
-      { name: "BROWSER", value: "must-not-run" },
+      { name: "GOOGLE_APPLICATION_CREDENTIALS", value: "/user/adc.json" },
+      { name: "ELECTRON_RUN_AS_NODE", value: "1" },
     ].map((variable) => ({ ...variable, sensitive: false })),
-  }).pipe(
-    Effect.provide(layerInstallation),
-    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observedSpawner),
-  );
+  }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observedSpawner));
   const refresh = instance.refreshModels;
   if (!refresh) return yield* Effect.die("Antigravity does not expose model refresh.");
   const readRequests = Effect.gen(function* () {
@@ -219,28 +133,10 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     for (const launch of launches) {
       yield* launch.handle.exitCode.pipe(Effect.ignore);
       expect(yield* launch.handle.isRunning).toBe(false);
-      if (launch.cwd) expect(yield* fs.exists(launch.cwd)).toBe(false);
-      if (launch.tempDirectory) expect(yield* fs.exists(launch.tempDirectory)).toBe(false);
+      if (launch.cwd && launch.args[0] === "acp") expect(yield* fs.exists(launch.cwd)).toBe(false);
     }
   });
-  return {
-    instance,
-    refresh,
-    fs,
-    path,
-    profileDirectory,
-    directories,
-    instancePath,
-    first,
-    second,
-    signedOut,
-    controls,
-    acquisitions,
-    releases,
-    launches,
-    readRequests,
-    assertClosed,
-  };
+  return { instance, refresh, executablePath, launches, readRequests, assertClosed };
 });
 
 const layerDeps = ServerConfig.layerTest(process.cwd(), {
@@ -275,77 +171,77 @@ const layerTest = ProviderHostLive.layer.pipe(
 );
 
 it.layer(layerTest)("AntigravityDriver", (it) => {
+  it.effect.skipIf(windowsHost)("refreshes through `agy acp` with the user's environment", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.refresh();
+      const snapshot = yield* h.instance.snapshot.getSnapshot;
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.auth.status).toBe("authenticated");
+      expect(snapshot.models.map((model) => model.slug)).toEqual([
+        "gemini-test-low",
+        "gemini-test-high",
+      ]);
+      expect(snapshot.models[0]?.aliases).toContain(ANTIGRAVITY_DEFAULT_MODEL);
+      expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["plan", "logout"]);
+
+      const acpLaunches = h.launches.filter((launch) => launch.args[0] === "acp");
+      expect(acpLaunches.length).toBeGreaterThan(0);
+      for (const launch of acpLaunches) {
+        expect(launch.command).toBe(h.executablePath);
+        expect(launch.args).toEqual(["acp"]);
+        expect(launch.extendEnv).toBe(false);
+        // The user's own credentials reach agy; only the Electron-as-Node switch is dropped.
+        expect(launch.environment.GOOGLE_APPLICATION_CREDENTIALS).toBe("/user/adc.json");
+        expect(launch.environment.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        expect(launch.environment.GEMINI_HOME).toBeUndefined();
+      }
+      const requests = yield* h.readRequests;
+      // A Google-account session never authenticates unattended: agy would open a browser.
+      expect(requests.map((request) => request.method)).toEqual(["initialize", "session/new"]);
+      expect(requests[1]?.params?.mcpServers).toEqual([]);
+      yield* h.assertClosed;
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)("reads the version from `agy --version`", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.instance.snapshot.refresh;
+      const snapshot = yield* h.instance.snapshot.getSnapshot;
+      expect(snapshot.installed).toBe(true);
+      expect(snapshot.version).toBe("1.5.1");
+      expect(h.launches.map((launch) => launch.args)).toContainEqual(["--version"]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect.skipIf(windowsHost)(
-    "refreshes through the selected executable and personal Google ACP",
+    "starts an instance with its own home in --gemini-dir relative to HOME",
     () =>
       Effect.gen(function* () {
-        const h = yield* makeHarness();
+        const h = yield* makeHarness({ config: { homePath: "~/.t3-agy-driver-test/gemini" } });
         yield* h.refresh();
-        const snapshot = yield* h.instance.snapshot.getSnapshot;
-        expect(snapshot.status).toBe("ready");
-        expect(snapshot.auth.status).toBe("authenticated");
-        expect(snapshot.models.map((model) => model.slug)).toEqual([
-          "gemini-test-low",
-          "gemini-test-high",
-        ]);
-        expect(snapshot.models[0]?.aliases).toContain(ANTIGRAVITY_DEFAULT_MODEL);
-        expect(snapshot.models.every((model) => model.isLegacy !== true)).toBe(true);
-        expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["plan", "logout"]);
-        expect(snapshot.supportsTextGeneration).toBe(true);
-        h.controls.selected = h.second;
-        yield* h.refresh();
-
-        expect(h.acquisitions).toEqual([
-          { binaryPath: "", path: h.instancePath },
-          { binaryPath: "", path: h.instancePath },
-        ]);
-        const nativeLaunches = h.launches.filter((launch) => launch.harnessPath !== undefined);
-        expect(nativeLaunches.map((launch) => launch.command)).toEqual([
-          h.first.executablePath,
-          h.second.executablePath,
-        ]);
-        expect(nativeLaunches.map((launch) => launch.harnessPath)).toEqual([
-          h.first.harnessPath,
-          h.second.harnessPath,
-        ]);
-        for (const launch of nativeLaunches) {
-          expect(launch.args).toEqual(hostPlatform === "linux" ? ["--uid="] : []);
-          expect(launch.profileDirectory).toBe(h.profileDirectory);
-          expect(launch.forceFileStorage).toBe("1");
-          expect(launch.extendEnv).toBe(false);
-        }
-        for (const launch of h.launches) expect(launch.credentialKeys).toEqual([]);
-        expect(h.releases).toEqual([h.first.version, h.second.version]);
-        const requests = yield* h.readRequests;
-        expect(requests.map((request) => request.method)).toEqual([
-          "initialize",
-          "auth/login",
-          "session/new",
-          "initialize",
-          "auth/login",
-          "session/new",
-        ]);
-        expect(
-          requests
-            .filter((request) => request.method === "auth/login")
-            .map((request) => request.params?.methodId),
-        ).toEqual(["oauth-personal", "oauth-personal"]);
-        expect(
-          requests
-            .filter((request) => request.method === "session/new")
-            .map((request) => request.params?.mcpServers),
-        ).toEqual([[], []]);
-        yield* h.assertClosed;
+        const launch = h.launches.find((candidate) => candidate.args[0] === "acp");
+        expect(launch?.args).toEqual(["acp", "--gemini-dir", ".t3-agy-driver-test/gemini"]);
       }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)("refuses a home outside the user's home directory", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ config: { homePath: "/tmp/agy-elsewhere" } });
+      const error = yield* h.refresh().pipe(Effect.flip);
+      expect(error.detail).toContain("inside your home directory");
+      expect(h.launches.filter((launch) => launch.args[0] === "acp")).toEqual([]);
+    }).pipe(Effect.scoped),
   );
 
   it.effect.skipIf(windowsHost)(
     "closes refresh processes and clears account metadata when Google sign-in is required",
     () =>
       Effect.gen(function* () {
-        const h = yield* makeHarness();
-        yield* h.refresh();
-        h.controls.selected = h.signedOut;
+        const ready = yield* makeHarness();
+        yield* ready.refresh();
+        const h = yield* makeHarness({ signedOut: true });
         const error = yield* h.refresh().pipe(Effect.flip);
         expect(error.detail).toContain("Sign in to Antigravity");
         const snapshot = yield* h.instance.snapshot.getSnapshot;
@@ -353,64 +249,19 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(snapshot.models).toEqual([]);
         expect(snapshot.slashCommands).toEqual([]);
         expect(snapshot.supportsTextGeneration).toBe(false);
-        expect(h.acquisitions).toHaveLength(2);
-        expect(h.releases).toEqual([h.first.version, h.signedOut.version]);
         yield* h.assertClosed;
       }).pipe(Effect.scoped),
   );
 
-  it.effect.skipIf(windowsHost)("keeps the previous catalog when executable resolution fails", () =>
+  it.effect.skipIf(windowsHost)("keeps the previous catalog when agy cannot be started", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();
       yield* h.refresh();
       const before = yield* h.instance.snapshot.getSnapshot;
-      h.controls.failResolution = true;
-      const error = yield* h.refresh().pipe(Effect.flip);
+      const missing = yield* makeHarness({ config: { binaryPath: "/nonexistent/agy" } });
+      const error = yield* missing.refresh().pipe(Effect.flip);
       expect(error.detail).toContain("previous model list is unchanged");
-      const after = yield* h.instance.snapshot.getSnapshot;
-      expect(after.models).toEqual(before.models);
-      expect(after.auth).toEqual(before.auth);
-      expect(h.acquisitions).toHaveLength(2);
-      expect(h.releases).toEqual([h.first.version]);
-      yield* h.assertClosed;
+      expect(yield* h.instance.snapshot.getSnapshot).toEqual(before);
     }).pipe(Effect.scoped),
-  );
-
-  it.effect.skipIf(windowsHost)(
-    "removes runtime temp directories left by a previous server on create",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const config = yield* ServerConfig.ServerConfig;
-        const instanceId = ProviderInstanceId.make("antigravity-orphan-sweep");
-        const directories = yield* resolveAntigravityInstanceDirectories(
-          config.stateDir,
-          instanceId,
-        );
-        const legacyRoot = path.join(directories.profile, "antigravity-acp", "tmp");
-        for (const root of [directories.runtimeTemp, legacyRoot]) {
-          const orphan = path.join(root, "run-orphan", "_MEI123", "google3");
-          yield* fs.makeDirectory(orphan, { recursive: true });
-          yield* fs.writeFileString(path.join(orphan, "payload.bin"), "stale");
-        }
-        yield* AntigravityDriver.create({
-          instanceId,
-          displayName: "Sweep",
-          enabled: false,
-          config: AntigravityDriver.defaultConfig(),
-          environment: [],
-        }).pipe(
-          Effect.provide(
-            Layer.mock(AntigravityInstallation.AntigravityInstallation)({
-              managedDirectory: config.stateDir,
-              resolve: () => Effect.die("unused"),
-              acquire: () => Effect.die("unused"),
-            }),
-          ),
-        );
-        expect(yield* fs.exists(directories.runtimeTemp)).toBe(false);
-        expect(yield* fs.exists(legacyRoot)).toBe(false);
-      }).pipe(Effect.scoped),
   );
 });

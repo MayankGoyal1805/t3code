@@ -12,7 +12,7 @@ import * as Stream from "effect/Stream";
 import { type AcpError, AcpRequestError } from "effect-acp/errors";
 
 import { applyAntigravityAcpModelSelection } from "../provider/acp/AntigravityAcpSupport.ts";
-import { removeAntigravitySessionFiles } from "../provider/acp/AntigravitySessionFiles.ts";
+import { removeAntigravityConversation } from "../provider/Drivers/AntigravityHome.ts";
 import {
   ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
   isAntigravitySignInRequiredError,
@@ -70,8 +70,13 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
 )(function* (profileDirectory: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  for (const name of ["hooks.json", "mcp_config.json"]) {
-    const configurationPath = path.join(profileDirectory, "config", name);
+  const locations = ["config", "antigravity-cli"].flatMap((directory) =>
+    ["hooks.json", "mcp_config.json"].map((name) => ({
+      name,
+      configurationPath: path.join(profileDirectory, directory, name),
+    })),
+  );
+  for (const { name, configurationPath } of locations) {
     if (!(yield* fs.exists(configurationPath))) {
       continue;
     }
@@ -79,6 +84,7 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
     if (info.type !== "File" || info.size > 64_000n) {
       return false;
     }
+    if (info.size === 0n) continue;
     const empty = yield* fs.readFileString(configurationPath).pipe(
       Effect.flatMap(decodeConfiguration),
       Effect.flatMap((configuration) =>
@@ -149,11 +155,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
         const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-text-" });
         let sessionId: string | undefined;
         yield* Effect.addFinalizer(() =>
-          removeAntigravitySessionFiles({
-            profileDirectory: options.profileDirectory,
-            sessionId,
-            cwd,
-          }).pipe(
+          removeAntigravityConversation(options.profileDirectory, sessionId).pipe(
             Effect.provideService(FileSystem.FileSystem, fs),
             Effect.provideService(Path.Path, path),
           ),

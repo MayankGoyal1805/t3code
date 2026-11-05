@@ -1,23 +1,34 @@
 {
-  "protocolVersion": 2,
+  "protocolVersion": 1,
   "agentCapabilities": {
     "loadSession": true,
     "promptCapabilities": {
       "image": true,
-      "audio": true,
+      "audio": false,
       "embeddedContext": true
     },
-    "mcpCapabilities": {
-      "http": true,
-      "sse": true
-    },
     "sessionCapabilities": {
+      "resume": {},
+      "close": {},
+      "load": {},
       "list": {},
-      "resume": {}
+      "additionalDirectories": {}
     },
     "auth": {
       "logout": {}
+    },
+    "_meta": {
+      "antigravity": {
+        "tier": true,
+        "systemPrompt": {
+          "append": true
+        }
+      }
     }
+  },
+  "agentInfo": {
+    "name": "Antigravity ACP Server",
+    "version": "1.5.1"
   },
   "authMethods": [
     {
@@ -38,12 +49,7 @@
     {
       "id": "agent-platform",
       "name": "Gemini Enterprise Agent Platform",
-      "description": "Use Gemini Enterprise Agent Platform (formerly Vertex AI) with Application Default Credentials or an API key"
+      "description": "Use Gemini Enterprise Agent Platform (formerly Vertex AI) with Application Default Credentials"
     }
-  ],
-  "agentInfo": {
-    "name": "antigravity-acp",
-    "title": "Google Antigravity",
-    "version": "agy_acp_server_1.1.1"
-  }
+  ]
 }

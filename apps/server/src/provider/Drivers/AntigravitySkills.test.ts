@@ -22,9 +22,11 @@ const makeWorkspace = Effect.fn("makeWorkspace")(function* () {
   const temporaryDirectory = yield* fileSystem.makeTempDirectoryScoped({
     prefix: "t3-antigravity-skills-",
   });
+  const userHome = path.join(temporaryDirectory, "home");
   return {
     cwd: path.join(temporaryDirectory, "workspace"),
-    userHome: path.join(temporaryDirectory, "home"),
+    userHome,
+    geminiDirectory: path.join(userHome, ".gemini"),
   };
 });
 

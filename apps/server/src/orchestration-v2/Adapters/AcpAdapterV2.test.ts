@@ -5130,6 +5130,81 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.effect.each(["id", "declines", "dies"] as const)("rollbackSession hook %s", (hook) =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const instanceId = ProviderInstanceId.make(`acp-test-rollback-hook-${hook}`);
+      const runtimeInputs: Array<AcpAdapterV2RuntimeInput> = [];
+      const hookInputs: Array<{ nativeSessionId: string; cwd: string }> = [];
+      const makeRuntime = makeMockRuntime({ childProcessSpawner, mockAgentPath });
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: (runtimeInput) =>
+            Effect.sync(() => runtimeInputs.push(runtimeInput)).pipe(
+              Effect.andThen(makeRuntime(runtimeInput)),
+            ),
+          rollbackSession: (hookInput) =>
+            Effect.sync(() => {
+              hookInputs.push({ nativeSessionId: hookInput.nativeSessionId, cwd: hookInput.cwd });
+            }).pipe(
+              Effect.andThen(
+                hook === "id"
+                  ? Effect.succeed({ sessionId: "rolled-back-session" })
+                  : hook === "declines"
+                    ? Effect.undefined
+                    : Effect.die("boom"),
+              ),
+            ),
+        },
+        selfInvocation,
+      });
+      const threadId = ThreadId.make(`thread-acp-rollback-hook-${hook}`);
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`provider-session-acp-rollback-hook-${hook}`),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const rolledBack = yield* runtime.rollbackThread({
+        providerThread,
+        providerThreadTurns: [],
+        target: {
+          type: "thread_start",
+          checkpointId: CheckpointId.make(`checkpoint-acp-rollback-hook-${hook}`),
+          appRunOrdinal: 0,
+        },
+      });
+      assert.deepEqual(hookInputs, [
+        { nativeSessionId: providerThread.nativeThreadRef?.nativeId ?? "", cwd: process.cwd() },
+      ]);
+      if (hook === "id") {
+        assert.equal(runtimeInputs[1]?.resumeSessionId, "rolled-back-session");
+        assert.equal(rolledBack.providerThread.nativeThreadRef?.nativeId, "rolled-back-session");
+      } else {
+        assert.isUndefined(runtimeInputs[1]?.resumeSessionId);
+      }
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.effect("quarantines callbacks from a failed rollback replacement before retrying", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

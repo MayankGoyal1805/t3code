@@ -48,7 +48,6 @@ import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from ".
 import { BUNDLED_CLAUDE_MODEL_CATALOG } from "./ClaudeModelCatalog.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
-import * as AntigravityInstallation from "./AntigravityInstallation.ts";
 import * as ModelManifest from "./ModelManifest.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
 import * as ResetCreditCoordinator from "./resetCreditCoordinator.ts";
@@ -1362,7 +1361,7 @@ it.layer(
         installed: true,
         auth: { status: "authenticated", type: "oauth-personal", label: "Google account" },
         checkedAt: "2026-09-05T00:00:00.000Z",
-        version: "agy_acp_server_1.1.1",
+        version: "1.5.1",
         models: [
           {
             slug: "gemini-3.7-flash-high",
@@ -2733,7 +2732,6 @@ it.layer(
           Layer.provideMerge(
             ProviderInstanceRegistryHydration.layer.pipe(Layer.provide(PortScanner.layerTest)),
           ),
-          Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
           Layer.provideMerge(
             Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
           ),
@@ -2851,7 +2849,6 @@ it.layer(
           Layer.provideMerge(
             ProviderInstanceRegistryHydration.layer.pipe(Layer.provide(PortScanner.layerTest)),
           ),
-          Layer.provideMerge(AntigravityInstallation.AntigravityInstallation.layer),
           Layer.provideMerge(
             Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
           ),
@@ -2959,7 +2956,6 @@ it.layer(
       } satisfies ServerSettingsModule.ServerSettingsService["Service"];
       const dependencies = yield* Layer.build(
         Layer.mergeAll(
-          AntigravityInstallation.AntigravityInstallation.layer,
           ServerSecretStore.layer,
           OpenCodeRuntime.layer.pipe(Layer.provide(OpenCodeServerLedger.layerTest)),
         ).pipe(

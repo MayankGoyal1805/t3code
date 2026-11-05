@@ -102,7 +102,6 @@ import * as ManagedLimits from "./policy/managedLimits.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as ProjectEnrichmentService from "./project/ProjectEnrichmentService.ts";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
-import * as AntigravityInstallation from "./provider/AntigravityInstallation.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
 import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegistry.ts";
@@ -594,20 +593,12 @@ const layerThreadPullRequestWorker = Layer.effectDiscard(
 
 const layerProviderInstallationRefresh = Layer.effectDiscard(
   Effect.gen(function* () {
-    const antigravity = yield* AntigravityInstallation.AntigravityInstallation;
     const codex = yield* CodexInstallation.CodexInstallation;
     const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const providers = yield* ProviderRegistry.ProviderRegistry;
-    yield* Stream.merge(
-      antigravity.changes.pipe(
-        Stream.changesWith((a, b) => a.installedVersion === b.installedVersion),
-        Stream.drop(1),
-      ),
-      codex.changes.pipe(
-        Stream.changesWith((a, b) => a.installedVersion === b.installedVersion),
-        Stream.drop(1),
-      ),
-    ).pipe(
+    yield* codex.changes.pipe(
+      Stream.changesWith((a, b) => a.installedVersion === b.installedVersion),
+      Stream.drop(1),
       Stream.runForEach((state) =>
         instances.listInstances.pipe(
           Effect.flatMap((entries) =>
@@ -682,12 +673,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   // Provider hydration builds the Claude runner, which reports agents to the same scanner the
   // terminal and preview layers share.
   Layer.provideMerge(layerPortScanner),
-  Layer.provideMerge(
-    Layer.mergeAll(
-      AntigravityInstallation.AntigravityInstallation.layer,
-      CodexInstallation.CodexInstallation.layer,
-    ),
-  ),
+  Layer.provideMerge(CodexInstallation.CodexInstallation.layer),
 );
 
 const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(

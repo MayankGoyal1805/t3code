@@ -1,32 +1,27 @@
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
-import * as ServerConfig from "../config.ts";
-import { resolveAntigravityInstanceDirectories } from "../provider/antigravityAuthSupport.ts";
 import {
-  ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-  describeAntigravitySubagentLaunches,
-} from "../provider/acp/AntigravityChildWork.ts";
-import {
-  CHILD,
-  invokeStep,
-  LAUNCH,
+  CALL_ID,
+  childSteps,
+  launched,
   makeProfile,
   ROOT,
 } from "../provider/acp/AntigravityChildWork.testkit.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as NativeChildWorkQuery from "./NativeChildWorkQuery.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 const instanceId = ProviderInstanceId.make("antigravity");
 const childThreadId = ThreadId.make("thread-child");
-const launch = describeAntigravitySubagentLaunches([LAUNCH]);
 
-// A permission-prompt batch in session ROOT, plus an older batch with no launch text in `olderRun`.
-const records = (olderRun: string) => ({
+const records = (providerInstance: ProviderInstanceId) => ({
   thread: {
     id: childThreadId,
     creationSource: "provider",
@@ -41,37 +36,20 @@ const records = (olderRun: string) => ({
       origin: "provider_native",
       providerInstanceId: instanceId,
       runId: "run-root",
-      nativeTaskRef: { nativeId: "35bea692fa95447fbdae6333fec5515f" },
-      ...launch,
-    },
-    {
-      id: "subagent-old",
-      childThreadId: "thread-old",
-      driver: "antigravity",
-      origin: "provider_native",
-      providerInstanceId: instanceId,
-      runId: olderRun,
-      nativeTaskRef: { nativeId: "0ld" },
-      title: ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-      prompt: "Running",
+      nativeTaskRef: { nativeId: CALL_ID },
     },
   ],
-  runs: [
-    { id: "run-root", providerThreadId: "provider-root" },
-    { id: "run-root-earlier", providerThreadId: "provider-root" },
-    { id: "run-other", providerThreadId: "provider-other" },
-  ],
+  runs: [{ id: "run-root", providerThreadId: "provider-root" }],
   providerThreads: [
-    { id: "provider-root", providerInstanceId: instanceId, nativeThreadRef: { nativeId: ROOT } },
     {
-      id: "provider-other",
-      providerInstanceId: instanceId,
-      nativeThreadRef: { nativeId: "00000000-0000-4000-8000-000000000000" },
+      id: "provider-root",
+      providerInstanceId: providerInstance,
+      nativeThreadRef: { nativeId: ROOT },
     },
   ],
 });
 
-const readChildren = (olderRun: string) =>
+const readChildren = (providerInstance: ProviderInstanceId, home: string) =>
   Effect.gen(function* () {
     const query = yield* NativeChildWorkQuery.NativeChildWorkQuery;
     return (yield* query.getNativeChildWork({ threadId: childThreadId })).children;
@@ -79,41 +57,33 @@ const readChildren = (olderRun: string) =>
     Effect.provide(
       NativeChildWorkQuery.layer.pipe(
         Layer.provide(
-          Layer.mock(ThreadManagement.ThreadManagementService)({
-            getThreadRecords: () => Effect.succeed(records(olderRun) as never),
-          }),
+          Layer.mergeAll(
+            ServerSettings.ServerSettingsService.layerTest(),
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadRecords: () => Effect.succeed(records(providerInstance) as never),
+            }),
+          ),
         ),
       ),
     ),
+    Effect.provideService(HostProcess.HomeDirectory, home),
   );
 
-it.layer(
-  Layer.mergeAll(
-    NodeServices.layer,
-    NodeCrypto.layer,
-    ServerConfig.layerTest(process.cwd(), { prefix: "native-child-work-" }).pipe(
-      Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-    ),
-  ),
-)("NativeChildWorkQuery", (it) => {
-  it.effect("weighs only batches from the same agent session", () =>
+it.layer(NodeServices.layer)("NativeChildWorkQuery", (it) => {
+  it.effect("reads the child of the subagent's own session", () =>
     Effect.gen(function* () {
-      const { stateDir } = yield* ServerConfig.ServerConfig;
-      const { profile } = yield* resolveAntigravityInstanceDirectories(stateDir, instanceId);
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "native-child-work-" });
       yield* makeProfile({
-        profile,
-        steps: (logUri) => [
-          [
-            2,
-            127,
-            invokeStep({ callId: "x", launches: [LAUNCH], children: [{ id: CHILD, logUri }] }),
-          ],
-        ],
+        profile: path.join(home, ".gemini"),
+        steps: launched,
+        child: { steps: childSteps },
       });
-      const fromOtherSession = yield* readChildren("run-other");
-      expect(fromOtherSession.map((child) => child.conversationId)).toEqual([CHILD]);
-      // An earlier run in the same session may own the only record.
-      expect(yield* readChildren("run-root-earlier")).toEqual([]);
+      const [child] = yield* readChildren(instanceId, home);
+      expect(child?.steps?.at(-1)?.text).toBe("marker 4242 found");
+      // A session from another provider instance has no claim on this instance's records.
+      expect(yield* readChildren(ProviderInstanceId.make("other"), home)).toEqual([]);
     }),
   );
 });

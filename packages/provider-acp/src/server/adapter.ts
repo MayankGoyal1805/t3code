@@ -363,6 +363,17 @@ export interface AcpAdapterV2Flavor {
       }
     | undefined;
   readonly withRuntimeStartup?: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  /**
+   * Truncates the agent's native conversation to the rollback target. Returns the id of the
+   * truncated session to load, or undefined (also on failure) to fall back to a fresh session.
+   */
+  readonly rollbackSession?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly target: ProviderAdapter.ProviderAdapterV2RollbackTarget;
+    readonly providerThreadTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+    readonly cwd: string;
+    readonly nativeSessionId: string;
+  }) => Effect.Effect<{ readonly sessionId: string } | undefined>;
   readonly makeRuntime: (
     input: AcpAdapterV2RuntimeInput,
   ) => Effect.Effect<
@@ -6888,6 +6899,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           commitSessionState: (
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
           ) => Effect.Effect<void>,
+          resumeSessionId?: string,
         ) {
           const previousScope = runtimeScope;
           const previousGeneration = yield* Ref.get(runtimeCallbackGeneration);
@@ -6934,7 +6946,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   replacementGeneration,
                   replacementAgentRequests,
                   mcpContext,
-                  undefined,
+                  resumeSessionId,
                   handleCandidateTermination,
                 ),
               )
@@ -9272,11 +9284,49 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   prepareTerminalEnvironment(
                     yield* readMcpContext(rollbackInput.providerThread.appThreadId),
                   );
-                  const replacement = yield* startReplacementAcpRuntime(
-                    rollbackInput.providerThread.appThreadId,
-                    (candidate) =>
-                      commitReplacementSession(rollbackInput.providerThread.appThreadId, candidate),
-                  ).pipe(Effect.retry({ times: 1 }));
+                  const rolledBack =
+                    flavor.rollbackSession === undefined
+                      ? undefined
+                      : yield* flavor
+                          .rollbackSession({
+                            providerThread: rollbackInput.providerThread,
+                            target: rollbackInput.target,
+                            providerThreadTurns: rollbackInput.providerThreadTurns,
+                            cwd: input.runtimePolicy.cwd ?? process.cwd(),
+                            nativeSessionId: yield* nativeThreadId(
+                              driver,
+                              rollbackInput.providerThread,
+                            ),
+                          })
+                          .pipe(
+                            Effect.catchCause((cause) =>
+                              Effect.logWarning(
+                                "native ACP rollback failed; starting a fresh session",
+                                { driver, cause },
+                              ).pipe(Effect.as(undefined)),
+                            ),
+                          );
+                  const startReplacement = (resumeSessionId?: string) =>
+                    startReplacementAcpRuntime(
+                      rollbackInput.providerThread.appThreadId,
+                      (candidate) =>
+                        commitReplacementSession(
+                          rollbackInput.providerThread.appThreadId,
+                          candidate,
+                        ),
+                      resumeSessionId,
+                    ).pipe(Effect.retry({ times: 1 }));
+                  const replacement =
+                    rolledBack === undefined
+                      ? yield* startReplacement()
+                      : yield* startReplacement(rolledBack.sessionId).pipe(
+                          Effect.catchCause((cause) =>
+                            Effect.logWarning(
+                              "loading rolled-back ACP session failed; starting a fresh session",
+                              { driver, cause },
+                            ).pipe(Effect.andThen(startReplacement())),
+                          ),
+                        );
                   const now = yield* DateTime.now;
                   return {
                     providerThread: {

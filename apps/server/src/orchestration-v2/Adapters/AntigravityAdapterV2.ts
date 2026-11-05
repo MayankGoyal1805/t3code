@@ -11,7 +11,6 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
-import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
 
@@ -32,18 +31,17 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
-import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
-  makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
 import { isAntigravitySignInRequiredError } from "../../provider/antigravityAuthSupport.ts";
+import { antigravityConversationExists } from "../../provider/Drivers/AntigravityHome.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -89,7 +87,7 @@ export interface AntigravityAdapterV2Options {
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
-  /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
+  /** The Gemini directory that holds agy's `antigravity-cli` data. Its conversations show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
 }
 
@@ -134,58 +132,47 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
-  const antigravityClientFileRoots = (cwd: string | null) =>
-    cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
+  const missingConversation = (sessionId: string) =>
+    new EffectAcpErrors.AcpRequestError({
+      code: -32002,
+      errorMessage: `Antigravity has no conversation ${sessionId}. It was created by an older T3 Code runtime or deleted from agy's history, so it cannot be resumed. Start a new thread.`,
+    });
+  const requireConversation = (sessionId: string) =>
+    profileDirectory === undefined
+      ? Effect.void
+      : antigravityConversationExists(profileDirectory, sessionId).pipe(
+          Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+          Effect.provideService(Path.Path, options.path),
+          // agy answers `session/load` for an unknown id with an empty session.
+          Effect.filterOrFail(Boolean, () => missingConversation(sessionId)),
+          Effect.asVoid,
+        );
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
+      if (input.resumeSessionId !== undefined) {
+        yield* requireConversation(input.resumeSessionId);
+      }
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
           Scope.close(scope, Exit.void),
           options.makeRuntime({
             ...input,
-            clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
             additionalDirectories: [options.host.paths.attachmentsDir],
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
-      // Repair keeps state across updates, so each runtime must have one session-update handler.
-      const reads = makeAntigravityReadRepair();
-      // Served reads are reported from the read handler, so they take turns with agent updates.
-      const updates = yield* Semaphore.make(1);
-      let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
       return {
         ...runtime,
-        handleReadTextFile: (handler) =>
-          runtime.handleReadTextFile((request, context) =>
-            handler(request, context).pipe(
-              Effect.onExit((exit) => {
-                const served = reads.attempted(request.path, Exit.isSuccess(exit));
-                if (served === undefined || projectUpdate === undefined) return Effect.void;
-                return updates
-                  .withPermit(
-                    projectUpdate({
-                      sessionId: served.sessionId,
-                      update: {
-                        sessionUpdate: "tool_call_update",
-                        toolCallId: served.toolCallId,
-                        status: "completed",
-                      },
-                    }),
-                  )
-                  .pipe(Effect.ignore);
-              }),
-            ),
+        loadSession: (sessionId, activation) =>
+          requireConversation(sessionId).pipe(
+            Effect.andThen(runtime.loadSession(sessionId, activation)),
           ),
-        prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
-        handleSessionUpdate: (handler) => {
-          projectUpdate = handler;
-          return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
-          );
-        },
+        resumeSession: (sessionId, activation) =>
+          requireConversation(sessionId).pipe(
+            Effect.andThen(runtime.resumeSession(sessionId, activation)),
+          ),
         start: () =>
           runtime
             .start()
@@ -212,21 +199,12 @@ export function makeAntigravityAcpAdapterFlavor(
     mcpOverHttp: true,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
-    buildPrompt: ({
-      text,
-      attachments,
-      resolveAttachmentPath,
-      promptCapabilities,
-      agentVersion,
-      currentModel,
-    }) =>
+    buildPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
       buildAntigravityPrompt({
         input: text,
         attachments,
         resolveAttachmentPath,
         promptCapabilities,
-        agentVersion,
-        currentModel,
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, options.fileSystem),
         Effect.provideService(Path.Path, options.path),
@@ -249,15 +227,6 @@ export function makeAntigravityAcpAdapterFlavor(
     }),
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
-    clientFileSystem: {
-      readTextFile: (request, cwd) =>
-        readAntigravityClientTextFile({
-          fileSystem: options.fileSystem,
-          path: options.path,
-          allowedRoots: antigravityClientFileRoots(cwd),
-          request,
-        }),
-    },
     approvalOptions: antigravityApprovalOptions,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);
@@ -270,12 +239,10 @@ export function makeAntigravityAcpAdapterFlavor(
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     supportsImagePrompts: true,
-    // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,
     requiresSignIn: isAntigravitySignInRequiredError,
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
-    // 1.4.5 returns the root trajectory's Gemini usageMetadata delta; 1.4.1 returns none.
     reportsPerTurnPromptUsage: true,
     geminiPromptUsage: true,
     ...(profileDirectory === undefined

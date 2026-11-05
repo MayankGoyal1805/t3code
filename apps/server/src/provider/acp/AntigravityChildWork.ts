@@ -1,8 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- node:sqlite reads the native session database read-only.
-import * as NodeFS from "node:fs";
-import * as NodeFSP from "node:fs/promises";
 import * as NodeSqlite from "node:sqlite";
-import * as NodeURL from "node:url";
 
 import type {
   OrchestrationV2NativeChildStep,
@@ -10,117 +7,86 @@ import type {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 
+import { messages, message, text } from "./AntigravityProto.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
-import { boundAntigravityToolText, isCutAntigravityToolText } from "./AntigravityProtocol.ts";
 
-// Field numbers from the runtime's trajectory protos (exa.cortex_pb).
+// Field numbers from the agy CLI's step protos (exa.cortex_pb), checked against 1.5.x databases.
 const STEP_METADATA = 5;
 const METADATA_TOOL_CALL = 4;
+const STEP_USER_INPUT_FIELD = 19;
 const STEP_PLANNER_RESPONSE = 20;
 const PLANNER_TOOL_CALLS = 7;
-const STEP_INVOKE_SUBAGENT = 143;
-const INVOKE_SPECS = 9;
-const INVOKE_RESULTS = 10;
-const INVOKE_SUBAGENT_STEP_TYPE = 127;
+const STEP_ERROR_FIELD = 24;
+const STEP_INBOUND_MESSAGE = 114;
+const STEP_TOOL_RESULT = 140;
+const TOOL_RESULT_TEXT = 1;
+const TOOL_RESULT_PAYLOAD = 2;
+const TOOL_RESULT_ANY = 6;
+const INVOKE_SUBAGENT_TYPE_URL = "type.googleapis.com/exa.cortex.core.tools.InvokeSubagent";
+const TOOL_STEP_TYPE = 132;
+const STEP_TYPE_NAMES: Readonly<Record<number, string>> = {
+  14: "USER_INPUT",
+  15: "PLANNER_RESPONSE",
+  17: "ERROR",
+  101: "MESSAGE",
+};
+const STEP_STATUS_DONE = 3;
 
-// One open reads at most this much; past any bound the batch view stays as it was.
+/** Where agy keeps conversation databases below the directory the provider hands this reader. */
+export const ANTIGRAVITY_CONVERSATION_SEGMENTS = ["antigravity-cli", "conversations"] as const;
+
+// One open reads at most this much; past any bound the child view stays as it was.
 const MAX_STEP_BYTES = 1024 * 1024;
-const MAX_INVOKE_ROWS = 200;
 const MAX_SCAN_BYTES = 8 * 1024 * 1024;
+const MAX_TOOL_STEP_CANDIDATES = 8;
+const MAX_CHILD_STEPS = 200;
 const MAX_CHILDREN = 16;
 const TRANSCRIPT_BYTE_CAP = 256 * 1024;
 const BATCH_TRANSCRIPT_BYTES = 512 * 1024;
 const STEP_TEXT_CAP = 4_000;
 const TOOL_INPUT_CAP = 1_000;
 
-/** T3's title for a batch whose launch text it never saw. */
+/** T3's title for a subagent call whose launch text it never saw. */
 export const ANTIGRAVITY_SUBAGENT_BATCH_TITLE = "Antigravity subagent batch";
 
 interface AntigravityChildLaunch {
   readonly role: string;
   readonly prompt: string;
+  readonly model: string | null;
 }
 
 const decodeLaunchInput = Schema.decodeUnknownOption(
   Schema.Struct({
-    Subagents: Schema.NonEmptyArray(Schema.Struct({ Role: Schema.String, Prompt: Schema.String })),
+    Role: Schema.String,
+    Prompt: Schema.String,
+    Model: Schema.optional(Schema.String),
   }),
 );
 
-/** `invoke_subagent` arguments, from the permission prompt or the persisted record. */
+/** `invoke_subagent` arguments from the ACP tool call: one subagent per call. */
 export function antigravitySubagentLaunches(
   input: unknown,
 ): ReadonlyArray<AntigravityChildLaunch> | undefined {
   return Option.getOrUndefined(
-    Option.map(decodeLaunchInput(input), (decoded) =>
-      decoded.Subagents.map((entry) => ({ role: entry.Role, prompt: entry.Prompt })),
-    ),
+    Option.map(decodeLaunchInput(input), (decoded) => [
+      { role: decoded.Role, prompt: decoded.Prompt, model: decoded.Model ?? null },
+    ]),
   );
 }
 
-/** Batch title and prompt; reads match permission-prompt tool call ids against this exact text. */
 export function describeAntigravitySubagentLaunches(
   launches: ReadonlyArray<AntigravityChildLaunch>,
 ) {
   const [only] = launches;
   return launches.length === 1 && only !== undefined
-    ? { title: only.role, prompt: only.prompt }
+    ? { title: only.role, prompt: only.prompt, model: only.model }
     : {
         title: launches.map((launch) => launch.role).join(", "),
         prompt: launches.map((launch) => `${launch.role}\n${launch.prompt}`).join("\n\n"),
+        model: null,
       };
-}
-
-/** Length-delimited fields only; varints and fixed values are skipped. */
-function protoFields(bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> {
-  const fields: Array<readonly [number, Uint8Array]> = [];
-  let offset = 0;
-  const varint = () => {
-    let value = 0;
-    for (let shift = 0; shift < 64; shift += 7) {
-      const byte = bytes[offset++];
-      if (byte === undefined) throw new Error("Truncated varint");
-      value += (byte & 0x7f) * 2 ** shift;
-      if (byte < 0x80) return value;
-    }
-    throw new Error("Overlong varint");
-  };
-  while (offset < bytes.length) {
-    const key = varint();
-    const wire = key % 8;
-    const field = Math.floor(key / 8);
-    if (wire === 0) varint();
-    else if (wire === 1) offset += 8;
-    else if (wire === 5) offset += 4;
-    else if (wire === 2) {
-      const length = varint();
-      if (offset + length > bytes.length) throw new Error("Truncated field");
-      fields.push([field, bytes.subarray(offset, offset + length)]);
-      offset += length;
-    } else throw new Error("Unsupported wire type");
-  }
-  if (offset > bytes.length) throw new Error("Truncated field");
-  return fields;
-}
-
-// Keep a leading byte order mark: T3 stores launch text with it.
-const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const messages = (bytes: Uint8Array, field: number) =>
-  protoFields(bytes).flatMap(([number, value]) => (number === field ? [value] : []));
-const message = (bytes: Uint8Array | undefined, field: number) =>
-  bytes === undefined ? undefined : messages(bytes, field)[0];
-const text = (bytes: Uint8Array | undefined, field: number) => {
-  const value = message(bytes, field);
-  return value === undefined ? undefined : textDecoder.decode(value);
-};
-
-interface InvokeRecord {
-  readonly toolCallId: string | undefined;
-  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
-  readonly children: ReadonlyArray<{ readonly conversationId: string; readonly logUri: string }>;
 }
 
 const NATIVE_ID = /^[A-Za-z0-9-]{1,64}$/;
@@ -136,31 +102,38 @@ const safely =
     }
   };
 
-const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
-  const invoke = message(payload, STEP_INVOKE_SUBAGENT);
-  if (invoke === undefined) return undefined;
-  const children = messages(invoke, INVOKE_RESULTS).map((result) => ({
-    conversationId: text(result, 1) ?? "",
-    logUri: text(result, 2) ?? "",
-  }));
-  if (!children.every((child) => NATIVE_ID.test(child.conversationId))) return undefined;
-  return {
-    toolCallId: text(message(message(payload, STEP_METADATA), METADATA_TOOL_CALL), 1),
-    launches: messages(invoke, INVOKE_SPECS).map((spec) => ({
-      role: text(spec, 2) ?? "",
-      prompt: text(spec, 3) ?? "",
-    })),
-    children,
-  };
-});
+interface InvokeRecord {
+  readonly toolCallId: string;
+  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
+  readonly conversationIds: ReadonlyArray<string>;
+}
 
-const plannerInvokeCallIds = safely((payload): ReadonlyArray<string> => {
-  const planner = message(payload, STEP_PLANNER_RESPONSE);
-  if (planner === undefined) return [];
-  return messages(planner, PLANNER_TOOL_CALLS).flatMap((call) => {
-    const id = text(call, 1);
-    return text(call, 2) === "invoke_subagent" && id !== undefined ? [id] : [];
-  });
+const toolCallOf = (payload: Uint8Array) =>
+  message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
+
+// Tool step {5: metadata{4: call{1 id, 2 name}}, 140: {2: result{6: Any InvokeSubagent{1: specs
+// {1 type, 2 role, 3 prompt, 12 model}, 2: children{1 conversation id}}}}}.
+const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
+  const toolCallId = text(toolCallOf(payload), 1);
+  const any = message(
+    message(message(payload, STEP_TOOL_RESULT), TOOL_RESULT_PAYLOAD),
+    TOOL_RESULT_ANY,
+  );
+  if (toolCallId === undefined || any === undefined || text(any, 1) !== INVOKE_SUBAGENT_TYPE_URL) {
+    return undefined;
+  }
+  const invoke = message(any, 2);
+  if (invoke === undefined) return undefined;
+  const conversationIds = messages(invoke, 2).map((child) => text(child, 1) ?? "");
+  if (!conversationIds.every((id) => NATIVE_ID.test(id))) return undefined;
+  const launches = messages(invoke, 1).map((spec) => ({
+    role: text(spec, 2) ?? "",
+    prompt: text(spec, 3) ?? "",
+    model: text(spec, 12) ?? null,
+  }));
+  return launches.length === conversationIds.length && conversationIds.length <= MAX_CHILDREN
+    ? { toolCallId, launches, conversationIds }
+    : undefined;
 });
 
 const payloadOf = (row: unknown) =>
@@ -171,240 +144,177 @@ const payloadOf = (row: unknown) =>
     ? row.step_payload
     : undefined;
 
-interface BatchLaunch {
-  readonly title: string | null;
-  readonly prompt: string;
-}
-
-const plannerCallIdsAt = (database: NodeSqlite.DatabaseSync, plannerIdx: number) => {
-  const planner = payloadOf(
-    database
-      .prepare(
-        "SELECT step_payload FROM steps WHERE idx = ? AND step_format = 0 AND length(step_payload) <= ?",
-      )
-      .get(plannerIdx, MAX_STEP_BYTES),
-  );
-  return planner === undefined ? undefined : plannerInvokeCallIds(planner);
-};
-
 /**
- * Auto-approved calls carry `<sessionId>:<plannerStep>`; the record with that planner call's id
- * is the proof. Permission prompts carry a random id, so the launch text must match one record
- * no auto-approved sibling claims, and no sibling may share the text.
+ * agy numbers a call `call_<digits>` in both the ACP stream and the step's metadata, so the
+ * record carrying that exact id in this session's own database is the proof. Candidates are
+ * found in the small metadata column; a payload that is oversized or ambiguous proves nothing.
  */
-function findInvokeRecord(
-  database: NodeSqlite.DatabaseSync,
-  input: {
-    readonly rootSessionId: string;
-    readonly nativeTaskId: string;
-    readonly launch: BatchLaunch;
-    readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
-  },
-): InvokeRecord | undefined {
-  const plannerIdxOf = (nativeTaskId: string) => {
-    const stepId = /^(.+):(\d+)$/.exec(nativeTaskId);
-    return stepId === null ? undefined : stepId[1] === input.rootSessionId ? Number(stepId[2]) : -1;
-  };
-  const plannerIdx = plannerIdxOf(input.nativeTaskId);
-  if (plannerIdx !== undefined) {
-    if (plannerIdx < 0) return undefined;
-    const callIds = plannerCallIdsAt(database, plannerIdx) ?? [];
-    const [callId] = callIds;
-    if (callIds.length !== 1) return undefined;
-    // The record follows the planner step that issued the call.
-    let rows = 0;
-    let bytes = 0;
-    for (const row of database
-      .prepare(
-        // SQLite returns only in-bound payloads, so an oversized row never reaches this process.
-        "SELECT length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND idx > ? ORDER BY idx",
-      )
-      .iterate(MAX_STEP_BYTES, INVOKE_SUBAGENT_STEP_TYPE, plannerIdx)) {
-      const size = row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
-      rows += 1;
-      bytes += size;
-      if (rows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || bytes > MAX_SCAN_BYTES)
-        return undefined;
-      const payload = payloadOf(row);
-      const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
-      if (record !== undefined && record.toolCallId === callId) return complete(record);
-    }
-    return undefined;
-  }
-  const totals = database
+function findInvokeRecord(database: NodeSqlite.DatabaseSync, nativeTaskId: string) {
+  const total = database
     .prepare(
-      "SELECT count(*) AS rows, coalesce(sum(length(step_payload)), 0) AS bytes, coalesce(max(length(step_payload)), 0) AS largest, sum(step_format != 0) AS other FROM steps WHERE step_type = ?",
+      "SELECT coalesce(sum(length(metadata)), 0) AS bytes FROM steps WHERE step_type = ? AND step_format = 0",
     )
-    .get(INVOKE_SUBAGENT_STEP_TYPE);
-  const total = (key: string) =>
-    totals !== undefined && key in totals ? Number(totals[key as keyof typeof totals] ?? 0) : 0;
-  const sameText = (launch: BatchLaunch) =>
-    launch.title === input.launch.title && launch.prompt === input.launch.prompt;
-  if (
-    input.siblings.some(sameText) ||
-    total("rows") > MAX_INVOKE_ROWS ||
-    total("bytes") > MAX_SCAN_BYTES ||
-    total("largest") > MAX_STEP_BYTES ||
-    total("other") > 0
-  ) {
-    return undefined;
-  }
-  const claimed = new Set<string>();
-  for (const sibling of input.siblings) {
-    const idx = plannerIdxOf(sibling.nativeTaskId);
-    // A sibling whose launch text is missing, or cut under the same roles, or whose planner step
-    // is unreadable, cannot be ruled out.
-    if (idx === undefined) {
-      if (
-        sibling.title === ANTIGRAVITY_SUBAGENT_BATCH_TITLE ||
-        (sibling.title !== null && isCutAntigravityToolText(sibling.title)) ||
-        (isCutAntigravityToolText(sibling.prompt) &&
-          (sibling.title === null || sibling.title === input.launch.title))
-      )
-        return undefined;
-      continue;
-    }
-    if (idx < 0) continue;
-    const callIds = plannerCallIdsAt(database, idx);
-    if (callIds === undefined || callIds.length === 0) return undefined;
-    for (const callId of callIds) claimed.add(callId);
-  }
+    .get(TOOL_STEP_TYPE);
+  if (Number(total?.bytes ?? 0) > MAX_SCAN_BYTES) return undefined;
   const matches: Array<InvokeRecord> = [];
+  let candidates = 0;
   for (const row of database
-    .prepare("SELECT step_payload FROM steps WHERE step_type = ? ORDER BY idx")
-    .iterate(INVOKE_SUBAGENT_STEP_TYPE)) {
+    .prepare(
+      // SQLite returns only in-bound payloads, so an oversized row never reaches this process.
+      "SELECT length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND length(metadata) <= ? AND instr(metadata, CAST(? AS BLOB)) > 0 ORDER BY idx LIMIT ?",
+    )
+    .iterate(
+      MAX_STEP_BYTES,
+      TOOL_STEP_TYPE,
+      MAX_STEP_BYTES,
+      nativeTaskId,
+      MAX_TOOL_STEP_CANDIDATES + 1,
+    )) {
+    candidates += 1;
     const payload = payloadOf(row);
-    const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
-    // An unreadable record could be an identical launch, so uniqueness is unproven.
+    // An unreadable candidate could be a second record with this id.
+    if (candidates > MAX_TOOL_STEP_CANDIDATES || payload === undefined) return undefined;
+    const callId = safely((bytes: Uint8Array) => text(toolCallOf(bytes), 1))(payload);
+    if (callId !== nativeTaskId) continue;
+    const record = decodeInvokeRecord(payload);
     if (record === undefined) return undefined;
-    if (record.toolCallId !== undefined && claimed.has(record.toolCallId)) continue;
-    // T3 stored the launch from the bounded tool payload, so bound the record the same way.
-    const described = describeAntigravitySubagentLaunches(
-      record.launches.map((launch) => ({
-        role: boundAntigravityToolText(launch.role),
-        prompt: boundAntigravityToolText(launch.prompt),
-      })),
-    );
-    if (sameText(described)) {
-      matches.push(record);
-    }
+    matches.push(record);
   }
   const [match] = matches;
-  return matches.length === 1 && match !== undefined ? complete(match) : undefined;
+  return matches.length === 1 ? match : undefined;
 }
-
-const complete = (record: InvokeRecord) =>
-  record.launches.length === record.children.length && record.children.length <= MAX_CHILDREN
-    ? record
-    : undefined;
-
-const TranscriptLine = Schema.Struct({
-  step_index: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  type: Schema.String,
-  status: Schema.optional(Schema.String),
-  content: Schema.optional(Schema.String),
-  error: Schema.optional(Schema.String),
-  tool_calls: Schema.optional(
-    Schema.Array(Schema.Struct({ name: Schema.String, args: Schema.optional(Schema.Unknown) })),
-  ),
-});
-const decodeTranscriptLine = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptLine));
-
-// The runtime records each tool argument value as JSON text.
-const decodeArgument = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
-const toolArguments = (args: unknown) =>
-  Predicate.isObject(args)
-    ? Object.fromEntries(
-        Object.entries(args).map(([key, value]) => [
-          key,
-          typeof value === "string" ? Option.getOrElse(decodeArgument(value), () => value) : value,
-        ]),
-      )
-    : (args ?? {});
 
 const capText = (value: string, limit: number) =>
   value.length <= limit ? value : `${value.slice(0, limit)}…`;
 
-/** Skips the runtime's opening envelope around the launch prompt the view already shows. */
-function transcriptSteps(
-  contents: string,
+const decodeChildStep = (
+  index: number,
+  type: number,
+  status: number,
+  payload: Uint8Array,
   prompt: string,
-): ReadonlyArray<OrchestrationV2NativeChildStep> {
-  const launchPrompt = prompt.trim();
-  return contents.split("\n").flatMap((line) =>
-    Option.match(decodeTranscriptLine(line), {
-      onNone: () => [],
-      onSome: (step) =>
-        step.step_index === 0 &&
-        step.type === "SYSTEM_MESSAGE" &&
-        launchPrompt !== "" &&
-        step.content?.includes(launchPrompt) === true
+) =>
+  safely((bytes): OrchestrationV2NativeChildStep | undefined => {
+    const step = (
+      stepType: string,
+      stepText: string | undefined,
+      toolCalls: OrchestrationV2NativeChildStep["toolCalls"] = [],
+    ) =>
+      stepText === undefined && toolCalls.length === 0
+        ? undefined
+        : {
+            index,
+            type: stepType,
+            status: status === STEP_STATUS_DONE ? "DONE" : null,
+            text: stepText === undefined ? null : capText(stepText, STEP_TEXT_CAP),
+            toolCalls,
+          };
+    if (type === 14) return step("USER_INPUT", text(message(bytes, STEP_USER_INPUT_FIELD), 2));
+    if (type === 15) {
+      const planner = message(bytes, STEP_PLANNER_RESPONSE);
+      return step(
+        "PLANNER_RESPONSE",
+        text(planner, 8) ?? text(planner, 1),
+        planner === undefined
           ? []
-          : [
-              {
-                index: step.step_index,
-                type: step.type,
-                status: step.status ?? null,
-                text:
-                  step.content !== undefined || step.error !== undefined
-                    ? capText(step.content ?? step.error ?? "", STEP_TEXT_CAP)
-                    : null,
-                toolCalls: (step.tool_calls ?? []).map((call) => ({
-                  name: call.name,
-                  input: capText(JSON.stringify(toolArguments(call.args)), TOOL_INPUT_CAP),
-                })),
-              },
-            ],
-    }),
-  );
+          : messages(planner, PLANNER_TOOL_CALLS).map((call) => ({
+              name: text(call, 2) ?? "",
+              input: capText(text(call, 3) ?? "", TOOL_INPUT_CAP),
+            })),
+      );
+    }
+    if (type === 17) {
+      const error = message(message(bytes, STEP_ERROR_FIELD), 3);
+      return step("ERROR", text(error, 9) ?? text(error, 2) ?? text(error, 1));
+    }
+    if (type === 101) {
+      const body = text(message(message(message(bytes, STEP_INBOUND_MESSAGE), 2), 10), 1);
+      // The launch prompt is the child's first message, and the view already shows it.
+      return body !== undefined && body.trim() === prompt.trim()
+        ? undefined
+        : step(STEP_TYPE_NAMES[101]!, body);
+    }
+    const name = text(toolCallOf(bytes), 2);
+    if (name === undefined) return undefined;
+    return step(
+      name.toUpperCase(),
+      text(message(message(bytes, STEP_TOOL_RESULT), TOOL_RESULT_PAYLOAD), TOOL_RESULT_TEXT),
+    );
+  })(payload);
+
+/** The child's newest steps within a byte budget; `truncated` when earlier ones were left out. */
+function readChildSteps(database: NodeSqlite.DatabaseSync, prompt: string, byteCap: number) {
+  const newestFirst: Array<OrchestrationV2NativeChildStep> = [];
+  let rows = 0;
+  let scanned = 0;
+  let kept = 0;
+  let truncated = false;
+  for (const row of database
+    .prepare(
+      "SELECT idx, step_type, status, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_format = 0 ORDER BY idx DESC LIMIT ?",
+    )
+    .iterate(MAX_STEP_BYTES, MAX_CHILD_STEPS + 1)) {
+    const record = row as Record<string, unknown>;
+    rows += 1;
+    scanned += Number(record.size ?? 0);
+    if (rows > MAX_CHILD_STEPS || scanned > MAX_SCAN_BYTES || kept > byteCap) {
+      truncated = true;
+      break;
+    }
+    const payload = payloadOf(record);
+    const step =
+      payload === undefined
+        ? undefined
+        : decodeChildStep(
+            Number(record.idx),
+            Number(record.step_type),
+            Number(record.status),
+            payload,
+            prompt,
+          );
+    if (step === undefined) continue;
+    kept +=
+      (step.text?.length ?? 0) + step.toolCalls.reduce((sum, call) => sum + call.input.length, 0);
+    newestFirst.push(step);
+  }
+  return { steps: newestFirst.toReversed(), truncated };
 }
 
-/** Reads the tail of the transcript at the named child's own unlinked profile path. */
-async function readChildTranscript(
+const childMetadataBytes = (database: NodeSqlite.DatabaseSync) => {
+  const row = database
+    .prepare(
+      "SELECT CASE WHEN length(data) <= ? THEN data END AS data FROM trajectory_metadata_blob WHERE id = 'main'",
+    )
+    .get(MAX_STEP_BYTES);
+  return row?.data instanceof Uint8Array ? row.data : undefined;
+};
+
+/** Reads the child's own conversation, only when it names this session as its parent. */
+async function readChild(
   profileRoot: string,
-  child: InvokeRecord["children"][number],
+  parentSessionId: string,
+  conversationId: string,
   prompt: string,
   byteCap: number,
 ) {
-  const expected = (
+  const databasePath = (
     await antigravityManagedPath(
       profileRoot,
-      [
-        "antigravity-acp",
-        "brain",
-        child.conversationId,
-        ".system_generated",
-        "logs",
-        "transcript.jsonl",
-      ],
+      [...ANTIGRAVITY_CONVERSATION_SEGMENTS, `${conversationId}.db`],
       "file",
     )
   )?.path;
-  if (expected === undefined) return undefined;
-  let named: string;
+  if (databasePath === undefined) return undefined;
+  const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
   try {
-    named = NodeURL.fileURLToPath(child.logUri);
-  } catch {
-    return undefined;
-  }
-  if ((await NodeFSP.realpath(named).catch(() => undefined)) !== expected) return undefined;
-  const handle = await NodeFSP.open(
-    expected,
-    NodeFS.constants.O_RDONLY | (NodeFS.constants.O_NOFOLLOW ?? 0),
-  );
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) return undefined;
-    const length = Math.min(stat.size, byteCap);
-    const buffer = Buffer.alloc(length);
-    const { bytesRead } = await handle.read(buffer, 0, length, stat.size - length);
-    const truncated = stat.size > length;
-    let contents = buffer.subarray(0, bytesRead).toString("utf8");
-    // A tail read starts mid-line.
-    if (truncated) contents = contents.slice(contents.indexOf("\n") + 1);
-    return { steps: transcriptSteps(contents, prompt), truncated };
+    database.exec("PRAGMA busy_timeout = 100");
+    // trajectory_metadata_blob.main field 5 is the conversation that spawned this one.
+    const metadata = childMetadataBytes(database);
+    const parent = metadata === undefined ? undefined : safely((bytes) => text(bytes, 5))(metadata);
+    if (parent !== parentSessionId) return undefined;
+    return readChildSteps(database, prompt, byteCap);
   } finally {
-    await handle.close();
+    database.close();
   }
 }
 
@@ -417,14 +327,11 @@ class AntigravityChildWorkReadError extends Schema.TaggedError<AntigravityChildW
   }
 }
 
-/** Children a subagent tool call launched, proven by the parent's own session record. */
+/** The child a subagent tool call launched, proven by the parent's own session record. */
 export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(function* (input: {
   readonly profileDirectory: string;
   readonly rootSessionId: string;
   readonly nativeTaskId: string;
-  readonly launch: BatchLaunch;
-  /** The thread's other Antigravity batches from this instance. */
-  readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
 }) {
   if (!NATIVE_ID.test(input.rootSessionId)) return [];
   return yield* Effect.tryPromise({
@@ -436,7 +343,7 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
           : (
               await antigravityManagedPath(
                 profileRoot,
-                ["antigravity-acp", "conversations", `${input.rootSessionId}.db`],
+                [...ANTIGRAVITY_CONVERSATION_SEGMENTS, `${input.rootSessionId}.db`],
                 "file",
               )
             )?.path;
@@ -444,31 +351,34 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
       const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
       let record: InvokeRecord | undefined;
       try {
-        record = findInvokeRecord(database, input);
+        database.exec("PRAGMA busy_timeout = 100");
+        record = findInvokeRecord(database, input.nativeTaskId);
       } finally {
         database.close();
       }
       if (record === undefined) return [];
-      const { launches, children } = record;
-      // One budget for the whole batch, so the response stays small however many children ran.
+      const { launches, conversationIds } = record;
+      // One budget for the whole call, so the response stays small however many children ran.
       const byteCap = Math.min(
         TRANSCRIPT_BYTE_CAP,
-        Math.floor(BATCH_TRANSCRIPT_BYTES / Math.max(1, children.length)),
+        Math.floor(BATCH_TRANSCRIPT_BYTES / Math.max(1, conversationIds.length)),
       );
       return Promise.all(
-        children.map(async (child, index) => {
-          const transcript = await readChildTranscript(
+        conversationIds.map(async (conversationId, index) => {
+          const launch = launches[index];
+          const child = await readChild(
             profileRoot,
-            child,
-            launches[index]?.prompt ?? "",
+            input.rootSessionId,
+            conversationId,
+            launch?.prompt ?? "",
             byteCap,
           ).catch(() => undefined);
           return {
-            conversationId: child.conversationId,
-            role: launches[index]?.role ?? "",
-            prompt: launches[index]?.prompt ?? "",
-            steps: transcript?.steps ?? null,
-            truncated: transcript?.truncated ?? false,
+            conversationId,
+            role: launch?.role ?? "",
+            prompt: launch?.prompt ?? "",
+            steps: child?.steps ?? null,
+            truncated: child?.truncated ?? false,
           };
         }),
       );

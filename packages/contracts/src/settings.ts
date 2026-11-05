@@ -778,7 +778,7 @@ export const ClaudeSettings = makeProviderSettingsSchema(
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;
 
-export const ANTIGRAVITY_AUTH_METHODS = [
+const ANTIGRAVITY_AUTH_METHODS = [
   { value: "oauth-personal", label: "Google account" },
   { value: "oauth-business", label: "Gemini Enterprise" },
   { value: "gemini-api-key", label: "Gemini API key" },
@@ -838,12 +838,20 @@ export const AntigravitySettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "us-central1", clearWhenEmpty: "omit" },
       }),
     ),
-    binaryPath: TrimmedString.pipe(
-      Schema.withDecodingDefault(Effect.succeed("")),
+    binaryPath: makeBinaryPathSetting("agy").pipe(
       Schema.annotateKey({
         title: "Binary path",
-        description: "Custom ACP executable. Leave empty to select automatically.",
-        providerSettingsForm: { placeholder: "Automatic", clearWhenEmpty: "persist" },
+        description: "Path to the Antigravity CLI (agy) used by this instance.",
+        providerSettingsForm: { placeholder: "agy", clearWhenEmpty: "omit" },
+      }),
+    ),
+    homePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Gemini directory",
+        description:
+          "Separate Antigravity credentials and conversations for this instance. Must be inside your home directory. Leave empty to share ~/.gemini with the agy CLI.",
+        providerSettingsForm: { placeholder: "~/.gemini", clearWhenEmpty: "omit" },
       }),
     ),
     customModels: Schema.Array(CustomModelSetting).pipe(
@@ -851,7 +859,7 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
-  { order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath"] },
+  { order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath", "homePath"] },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
 

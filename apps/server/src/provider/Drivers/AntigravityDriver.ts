@@ -2,10 +2,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import { AntigravitySettings, ProviderDriverKind, ProviderSetupError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
-import {
-  NodeRuntimeUnavailableError,
-  nodeRuntimeUnavailableMessage,
-} from "@t3tools/shared/nodeRuntime";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
@@ -16,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { HttpClient } from "effect/http";
 import type { AcpError } from "effect-acp/errors";
@@ -26,7 +24,6 @@ import {
   makeAntigravityTextGeneration,
 } from "../../textGeneration/AntigravityTextGeneration.ts";
 import { makeAntigravityAuth, type AntigravityAuth } from "../AntigravityAuth.ts";
-import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import * as AntigravityUsage from "./AntigravityUsage.ts";
 import {
   antigravityAuthConfigIssue,
@@ -34,8 +31,8 @@ import {
   antigravityAuthUsesBrowser,
   buildAntigravityAcpSpawnInput,
   isAntigravitySignInRequiredError,
-  prepareAntigravityProfile,
-  resolveAntigravityInstanceDirectories,
+  watchAntigravityAuthorizationUrl,
+  writeAntigravityBrowserCapture,
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
@@ -47,9 +44,10 @@ import {
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 import {
-  removeAntigravitySessionFiles,
-  retireAntigravityRuntimeTempDirs,
-} from "../acp/AntigravitySessionFiles.ts";
+  antigravityGeminiDirectoryArgs,
+  removeAntigravityConversation,
+  resolveAntigravityGeminiDirectory,
+} from "./AntigravityHome.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeAntigravityAdapterV2 } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
@@ -58,6 +56,18 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
 import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import {
+  makeCachedProviderMaintenanceResolution,
+  makeManualOnlyProviderMaintenanceCapabilities,
+  makeProviderMaintenanceCapabilities,
+  resolveProviderMaintenanceCapabilitiesEffect,
+  type ProviderMaintenanceCapabilitiesResolver,
+} from "@t3tools/provider-core/server/maintenanceResolver";
+import {
+  isCommandMissingCause,
+  parseGenericCliVersion,
+  spawnAndCollect,
+} from "@t3tools/provider-core/server/snapshotProbe";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
   defaultProviderContinuationIdentity,
@@ -66,14 +76,30 @@ import {
 } from "@t3tools/provider-core/server/driver";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
-import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
+import { discoverAntigravitySkills } from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
-const isNodeRuntimeUnavailableError = Schema.is(NodeRuntimeUnavailableError);
+
+// `agy update` replaces the binary in place, wherever the user installed it.
+const UPDATE: ProviderMaintenanceCapabilitiesResolver = {
+  resolve: (context) =>
+    Effect.succeed(
+      context
+        ? makeProviderMaintenanceCapabilities({
+            provider: DRIVER,
+            packageName: null,
+            updateExecutable: context.resolvedCommandPath,
+            updateArgs: ["update"],
+            updateLockKey: "antigravity",
+            platform: context.platform,
+            env: context.env,
+          })
+        : makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER, packageName: null }),
+    ),
+};
 
 export type AntigravityDriverEnv =
-  | AntigravityInstallation.AntigravityInstallation
   | ProviderHost.ProviderHost
   | ChildProcessSpawner.ChildProcessSpawner
   | Digest.Digest
@@ -110,9 +136,7 @@ export const AntigravityDriver: ProviderDriver<
     const httpClient = yield* HttpClient.HttpClient;
     const path = yield* Path.Path;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const host = yield* ProviderHost.ProviderHost;
     const selfInvocation = yield* resolveSelfInvocation();
-    const installation = yield* AntigravityInstallation.AntigravityInstallation;
     const loggers = yield* ProviderEventLoggers.ProviderEventLoggers;
     const modelCatalog = yield* ModelCatalog.ModelCatalog;
     const currentCatalog = modelCatalog.current(DRIVER);
@@ -127,38 +151,20 @@ export const AntigravityDriver: ProviderDriver<
     };
     const authConfigIssue = antigravityAuthConfigIssue(auth);
     const processEnvironment = yield* mergeProviderInstanceEnvironment(environment);
-    const userHome = resolveAntigravityUserHome(
-      yield* HostProcess.Platform,
-      processEnvironment,
-      yield* HostProcess.HomeDirectory,
-    );
-    const directories = yield* resolveAntigravityInstanceDirectories(
-      host.paths.stateDir,
-      instanceId,
-    ).pipe(
-      Effect.provideService(Digest.Digest, digest),
+    const geminiDirectory = yield* resolveAntigravityGeminiDirectory(settings).pipe(
       Effect.provideService(Path.Path, path),
-      Effect.mapError(
-        (cause) =>
-          new ProviderDriverError({
-            driver: DRIVER,
-            instanceId,
-            detail: "Could not resolve the Antigravity profile directory.",
-            cause,
-          }),
-      ),
     );
-    const profileDirectory = directories.profile;
-    for (const directory of [
-      directories.runtimeTemp,
-      path.join(profileDirectory, "antigravity-acp", "tmp"),
-    ]) {
-      const removeRetired = yield* retireAntigravityRuntimeTempDirs(directory).pipe(
+    const platform = yield* HostProcess.Platform;
+    const resolveMaintenance = yield* makeCachedProviderMaintenanceResolution(
+      resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
+        binaryPath: settings.binaryPath,
+        env: processEnvironment,
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
-      );
-      yield* Effect.forkScoped(removeRetired);
-    }
+      ),
+    );
     const continuationIdentity = defaultProviderContinuationIdentity({
       driverKind: DRIVER,
       instanceId,
@@ -189,74 +195,51 @@ export const AntigravityDriver: ProviderDriver<
           detail: authConfigIssue,
         });
       }
-      const executable = yield* installation.acquire(settings.binaryPath, processEnvironment).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderSetupError({
-              instanceId,
-              operation: "resolve",
-              detail: cause.detail,
-              cause,
-            }),
-        ),
-      );
-      const profile = yield* prepareAntigravityProfile({
-        profileDirectory,
-        baseEnv: processEnvironment,
-        auth,
-        userHome,
-        tempDirectory: directories.runtimeTemp,
-      }).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
+      const geminiDirectoryArgs = yield* antigravityGeminiDirectoryArgs(instanceId, settings).pipe(
         Effect.provideService(Path.Path, path),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.mapError((cause) =>
-          isNodeRuntimeUnavailableError(cause.cause)
-            ? new ProviderSetupError({
-                instanceId,
-                operation: "start",
-                detail: nodeRuntimeUnavailableMessage("Antigravity sign-in"),
-                cause,
-              })
-            : cause,
-        ),
       );
-      // Use one directory per process; shared cleanup could delete files another session still reads.
-      // Remove after the child dies, best-effort on Windows where handles may outlive the kill;
-      // the next driver start sweeps leftovers.
-      const runtimeTempDirectory = yield* Effect.acquireRelease(
-        fileSystem.makeTempDirectory({ directory: profile.tempDirectory, prefix: "run-" }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderSetupError({
-                instanceId,
-                operation: "start",
-                detail: "Could not create an Antigravity runtime temp directory.",
-                cause,
-              }),
-          ),
-        ),
-        (directory) =>
-          fileSystem
-            .remove(directory, { recursive: true, force: true })
-            .pipe(
-              Effect.catch(() =>
-                Effect.logWarning("Could not remove an Antigravity runtime temp directory."),
+      // agy discards a sign-in helper's output, so the browser stand-in hands the URL over in a file.
+      const browserCapture =
+        input.onAuthorizationUrl !== undefined && platform !== "win32"
+          ? yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-signin-" }).pipe(
+              Effect.flatMap((directory) =>
+                writeAntigravityBrowserCapture(directory).pipe(
+                  Effect.map((target) => ({ directory, target })),
+                ),
               ),
-            ),
-      );
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderSetupError({
+                    instanceId,
+                    operation: "start",
+                    detail: "Could not prepare Antigravity sign-in.",
+                    cause,
+                  }),
+              ),
+            )
+          : undefined;
+      if (browserCapture !== undefined && input.onAuthorizationUrl !== undefined) {
+        yield* watchAntigravityAuthorizationUrl(
+          browserCapture.target,
+          input.onAuthorizationUrl,
+        ).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem), Effect.forkScoped);
+      }
       const runtime = yield* makeAntigravityAcpRuntime({
         ...input,
-        runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
         spawn: buildAntigravityAcpSpawnInput({
-          installation: executable,
-          profile,
+          executablePath: settings.binaryPath,
+          geminiDirectoryArgs,
           cwd: input.cwd,
           baseEnv: processEnvironment,
           auth,
-          runtimeTempDirectory,
+          platform,
+          ...(browserCapture === undefined
+            ? {}
+            : { browserCaptureDirectory: browserCapture.directory }),
         }),
       }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
       return {
@@ -291,11 +274,7 @@ export const AntigravityDriver: ProviderDriver<
         );
       let sessionId: string | undefined;
       yield* Effect.addFinalizer(() =>
-        removeAntigravitySessionFiles({
-          profileDirectory,
-          sessionId,
-          cwd,
-        }).pipe(
+        removeAntigravityConversation(geminiDirectory, sessionId).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
         ),
@@ -360,9 +339,6 @@ export const AntigravityDriver: ProviderDriver<
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),
     });
 
-    // The probe must not spawn. The agent is a PyInstaller one-file bundle
-    // that unpacks about 1 GB per launch, and the health check runs every
-    // minute.
     const probe = Effect.gen(function* () {
       yield* modelCatalog.refreshInBackground;
       if (authConfigIssue !== null) {
@@ -372,13 +348,26 @@ export const AntigravityDriver: ProviderDriver<
           detail: authConfigIssue,
         });
       }
-      const executable = yield* installation.resolve(settings.binaryPath, processEnvironment).pipe(
+      const spawnCommand = yield* resolveSpawnCommand(settings.binaryPath, ["--version"], {
+        env: processEnvironment,
+      });
+      const output = yield* spawnAndCollect(
+        settings.binaryPath,
+        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+          env: processEnvironment,
+          shell: spawnCommand.shell,
+        }),
+      ).pipe(
+        Effect.timeout("20 seconds"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.mapError(
           (cause) =>
             new ProviderSetupError({
               instanceId,
-              operation: "resolve",
-              detail: cause.detail,
+              operation: isCommandMissingCause(cause) ? "resolve" : "start",
+              detail: isCommandMissingCause(cause)
+                ? "The Antigravity CLI (agy) is not installed or could not be found. Install it, or set its path in the Antigravity provider settings."
+                : "Could not run `agy --version`.",
               cause,
             }),
         ),
@@ -387,20 +376,20 @@ export const AntigravityDriver: ProviderDriver<
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
-          promptCapabilities: { image: true, audio: true, embeddedContext: true },
+          promptCapabilities: { image: true, audio: false, embeddedContext: true },
           sessionCapabilities: { list: {}, resume: {} },
         },
         authMethods: [{ id: "oauth-personal", name: "Log in with Google" }],
         agentInfo: {
-          name: "antigravity-acp",
+          name: "agy",
           title: "Google Antigravity",
-          version: executable.version ?? "unknown",
+          version: parseGenericCliVersion(`${output.stdout}\n${output.stderr}`) ?? "unknown",
         },
       };
     });
 
     const usage = yield* makeAntigravityUsageProbe({
-      profileDirectory,
+      profileDirectory: geminiDirectory,
       authMethod: auth.authMethod,
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -410,11 +399,12 @@ export const AntigravityDriver: ProviderDriver<
     );
     const provider = yield* makeAntigravityProvider(settings, {
       stampIdentity: classifyModels,
+      resolveMaintenance,
       probe,
       probeUsage: usage.probe,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
-      supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
+      supportsTextGeneration: isAntigravityTextGenerationAvailable(geminiDirectory).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
         Effect.orElseSucceed(() => false),
@@ -437,7 +427,7 @@ export const AntigravityDriver: ProviderDriver<
       makeRuntime,
       withProcess: authFlow.withProcess,
       defaultModel,
-      profileDirectory,
+      profileDirectory: geminiDirectory,
       onSessionStarted: provider.onSessionStarted,
       onSessionEvent: (event) => {
         if (event._tag === "ConfigOptionsUpdated") {
@@ -456,7 +446,7 @@ export const AntigravityDriver: ProviderDriver<
         }),
     });
     const textGeneration = yield* makeAntigravityTextGeneration({
-      profileDirectory,
+      profileDirectory: geminiDirectory,
       defaultModel,
       withProcess: authFlow.withProcess,
       makeRuntime: (cwd) =>
@@ -524,7 +514,7 @@ export const AntigravityDriver: ProviderDriver<
       snapshotForCwd: (cwd) =>
         !enabled
           ? provider.snapshot.getSnapshot
-          : discoverAntigravitySkills({ cwd, userHome }).pipe(
+          : discoverAntigravitySkills({ cwd, geminiDirectory }).pipe(
               Effect.provideService(FileSystem.FileSystem, fileSystem),
               Effect.provideService(Path.Path, path),
               Effect.flatMap((skills) => provider.snapshotForCwd(cwd, skills)),

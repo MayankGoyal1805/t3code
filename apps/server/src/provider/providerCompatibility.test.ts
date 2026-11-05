@@ -22,12 +22,7 @@ import {
   ProviderCompatibilityPolicy,
   resolveProviderCompatibility,
 } from "./providerCompatibility.ts";
-import { resolveAntigravityReleaseAsset } from "./antigravityRelease.ts";
-import bundledManifest from "./model-manifest.json" with { type: "json" };
 
-const decodeCompatibilityPolicies = Schema.decodeUnknownSync(
-  Schema.Array(ProviderCompatibilityPolicy),
-);
 const driver = ProviderDriverKind.make("codex");
 const policy: ProviderCompatibilityPolicy = {
   driver,
@@ -112,46 +107,6 @@ describe("provider compatibility", () => {
     );
   });
 
-  it("recognizes Antigravity semver release tags while keeping dated candidates unknown", () => {
-    const antigravity = ProviderDriverKind.make("antigravity");
-    const taggedPolicy = {
-      ...policy,
-      driver: antigravity,
-      ranges: [{ range: "=2.0.0", status: "supported" as const }],
-    };
-    for (const [version, expected] of [
-      ["agy_acp_server_2.0.0", "supported"],
-      ["2.0.0", "supported"],
-      ["agy_acp_server_2.0.1", "unknown"],
-      ["agy_acp_server_2.0.0-beta.1", "unknown"],
-      ["agy_acp_server_20260818_01_RC01", "unknown"],
-    ] as const) {
-      assert.strictEqual(
-        resolveProviderCompatibility([taggedPolicy], antigravity, version)?.status,
-        expected,
-      );
-    }
-  });
-
-  it.each([
-    ["darwin", "arm64"],
-    ["win32", "x64"],
-  ] as const)(
-    "supports the managed Antigravity runtime for %s-%s in the bundled manifest",
-    (platform, arch) => {
-      const policies = decodeCompatibilityPolicies(bundledManifest.compatibility);
-      const release = resolveAntigravityReleaseAsset(platform, arch);
-      assert.strictEqual(
-        resolveProviderCompatibility(
-          policies,
-          ProviderDriverKind.make("antigravity"),
-          `agy_acp_server_${release?.version}`,
-        )?.status,
-        "supported",
-      );
-    },
-  );
-
   it("classifies boundaries and treats unlisted versions and release tags as unknown", () => {
     for (const [version, expected] of [
       ["0.9.9", "broken"],
@@ -161,7 +116,6 @@ describe("provider compatibility", () => {
       ["v2.0.0", "supported"],
       ["3.0.0", "unknown"],
       ["2.0.0-beta.1", "unknown"],
-      ["agy_acp_server_20260818_01_RC01", "unknown"],
       [null, "unknown"],
     ] as const) {
       assert.strictEqual(resolveProviderCompatibility([policy], driver, version)?.status, expected);

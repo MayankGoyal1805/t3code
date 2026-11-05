@@ -5,7 +5,6 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type ChatAttachment,
 } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -18,7 +17,6 @@ import {
   applyAntigravityAcpModelSelection,
   antigravitySessionMeta,
   buildAntigravityPrompt,
-  isQualifiedAntigravityRelease,
 } from "./AntigravityAcpSupport.ts";
 
 const modelConfig = {
@@ -41,53 +39,41 @@ function makeModelRuntime(
     if (failure) return yield* failure;
     selections.push(model);
   });
-  const setConfigOption = Effect.fn("AntigravityAcpSupportTest.setConfigOption")(function* (
-    configId: string,
-    value: string | boolean,
-    options?: { readonly allowUnlistedValue?: boolean },
-  ) {
-    selections.push(
-      `${configId}=${String(value)}${options?.allowUnlistedValue === true ? " (unlisted)" : ""}`,
-    );
-    return { configOptions };
-  });
   return {
-    runtime: { getConfigOptions: Effect.succeed(configOptions), setModel, setConfigOption },
+    runtime: { getConfigOptions: Effect.succeed(configOptions), setModel },
     selections,
   };
 }
 
-describe("Antigravity release gates", () => {
+describe("Antigravity system prompt", () => {
   it.each([
-    { version: "1.4.1", filter: false, native: false },
-    { version: "1.4.2", filter: true, native: false },
-    { version: "1.4.4", filter: true, native: false },
-    { version: "1.4.5", filter: true, native: true },
-    { version: "1.4.6", filter: false, native: false },
-    { version: "1.3.0", filter: false, native: false },
-    { version: undefined, filter: false, native: false },
-    { version: "unknown", filter: false, native: false },
-  ])(
-    "$version: workflow filter $filter, native reads and system prompt $native",
-    ({ version, filter, native }) => {
-      const initialize = {
-        protocolVersion: 1,
-        ...(version === undefined ? {} : { agentInfo: { name: "antigravity-acp", version } }),
-      };
-      // Helpers send no append, so only the workflow filter can apply.
-      expect(antigravitySessionMeta(initialize)).toEqual(
-        filter ? { antigravity: { disabledTools: ["run_workflow"] } } : undefined,
-      );
-      const antigravity = {
-        ...(filter ? { disabledTools: ["run_workflow"] } : {}),
-        ...(native ? { systemPrompt: { append: "<pull_request_linking/>" } } : {}),
-      };
-      expect(antigravitySessionMeta(initialize, "<pull_request_linking/>")).toEqual(
-        filter || native ? { antigravity } : undefined,
-      );
-      expect(isQualifiedAntigravityRelease(version)).toBe(native);
-    },
-  );
+    { append: true, sent: true },
+    { append: false, sent: false },
+    { append: undefined, sent: false },
+  ])("sends the append only when agy advertises it ($append)", ({ append, sent }) => {
+    const initialize = {
+      protocolVersion: 1,
+      agentCapabilities: {
+        _meta: {
+          antigravity: {
+            tier: true,
+            ...(append === undefined ? {} : { systemPrompt: { append } }),
+          },
+        },
+      },
+    };
+    expect(antigravitySessionMeta(initialize, "<pull_request_linking/>")).toEqual(
+      sent ? { antigravity: { systemPrompt: { append: "<pull_request_linking/>" } } } : undefined,
+    );
+    // Helpers send no append.
+    expect(antigravitySessionMeta(initialize)).toBeUndefined();
+  });
+
+  it("sends nothing to an agent without antigravity metadata", () => {
+    expect(
+      antigravitySessionMeta({ protocolVersion: 1, agentCapabilities: {} }, "<pr/>"),
+    ).toBeUndefined();
+  });
 });
 
 describe("applyAntigravityAcpModelSelection", () => {
@@ -181,30 +167,6 @@ describe("applyAntigravityAcpModelSelection", () => {
 
       expect(model).toBe("gemini-saved");
       expect(selections).toEqual(["gemini-saved"]);
-    }),
-  );
-
-  it.effect("passes a model ID saved on runtime 1.3 to the agent as its 1.4 family", () =>
-    Effect.gen(function* () {
-      // The cold-resume model has no thinking option, so the level is unknown locally.
-      const { runtime, selections } = makeModelRuntime([
-        {
-          ...modelConfig,
-          currentValue: "gpt-oss-120b-medium",
-          options: [
-            { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-            { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
-          ],
-        },
-      ]);
-      const model = yield* applyAntigravityAcpModelSelection({
-        runtime,
-        model: "gemini-3.8-flash-low",
-        mapError: (cause) => cause,
-      });
-
-      expect(model).toBe("gemini-3.8-flash");
-      expect(selections).toEqual(["model=gemini-3.8-flash-low (unlisted)"]);
     }),
   );
 });
@@ -370,87 +332,31 @@ it.layer(NodeServices.layer)("buildAntigravityPrompt", (it) => {
     }),
   );
 
-  it.effect.each([
-    {
-      case: "a Gemini model id",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: true,
-    },
-    {
-      case: "an opaque id named Gemini",
-      model: { id: "agy-model", name: "Gemini 4 Carbon" },
-      linked: true,
-    },
-    { case: "an unknown model", model: { id: "agy-custom", name: "Custom" }, linked: false },
-    { case: "an unlisted opaque id", model: { id: "agy-custom", name: undefined }, linked: false },
-    { case: "an unresolved model", model: undefined, linked: false },
-    {
-      case: "a Claude model",
-      model: { id: "claude-opus-5-5", name: "Claude Opus 5.5" },
-      linked: false,
-    },
-    {
-      case: "an unqualified runtime",
-      agentVersion: "1.4.1",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-    },
-    {
-      case: "a Windows host",
-      platform: "win32" as const,
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-    },
-    {
-      case: "a clip over 20 MiB",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-      sizeBytes: 20 * 1024 * 1024 + 1,
-    },
-  ])(
-    "links an MP4 for $case only when supported",
-    ({ agentVersion = "1.4.5", platform = "linux", model, linked, ...size }) =>
-      Effect.gen(function* () {
-        const fixture = yield* makeAttachmentFixture();
-        const clip = {
-          ...textAttachment,
-          id: "clip",
-          name: "clip.mp4",
-          mimeType: "video/mp4",
-          sizeBytes: 6 * 1024 * 1024,
-          ...size,
-        };
-        const upload = yield* fixture.write(clip, "");
-        yield* fixture.fs.truncate(upload.filePath, clip.sizeBytes);
-        const prompt = yield* buildAntigravityPrompt({
-          input: "What colors appear?",
-          attachments: [clip],
-          resolveAttachmentPath: fixture.resolve,
-          promptCapabilities: { image: true, audio: true, embeddedContext: true },
-          agentVersion,
-          currentModel: model,
-        }).pipe(
-          Effect.provideService(HostProcess.Platform, platform),
-          Effect.provideService(FileSystem.FileSystem, {
-            ...fixture.fs,
-            stream: () => Effect.die("Linked video is read by the agent").pipe(Stream.fromEffect),
-          }),
-        );
-        expect(prompt).toEqual([
-          { type: "text", text: "What colors appear?" },
-          ...(linked
-            ? [
-                {
-                  type: "resource_link",
-                  uri: upload.uri,
-                  name: "clip.mp4",
-                  mimeType: "video/mp4",
-                  size: clip.sizeBytes,
-                },
-              ]
-            : []),
-        ]);
-      }),
+  it.effect("keeps video path-only because agy reads files itself", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeAttachmentFixture();
+      const clip = {
+        ...textAttachment,
+        id: "clip",
+        name: "clip.mp4",
+        mimeType: "video/mp4",
+        sizeBytes: 6 * 1024 * 1024,
+      };
+      const upload = yield* fixture.write(clip, "");
+      yield* fixture.fs.truncate(upload.filePath, clip.sizeBytes);
+      const prompt = yield* buildAntigravityPrompt({
+        input: "What colors appear?",
+        attachments: [clip],
+        resolveAttachmentPath: fixture.resolve,
+        promptCapabilities: { image: true, audio: false, embeddedContext: true },
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, {
+          ...fixture.fs,
+          stream: () => Effect.die("Video is read by the agent").pipe(Stream.fromEffect),
+        }),
+      );
+      expect(prompt).toEqual([{ type: "text", text: "What colors appear?" }]);
+    }),
   );
 
   it.effect.each([undefined, {}, { image: false, audio: false, embeddedContext: false }])(
