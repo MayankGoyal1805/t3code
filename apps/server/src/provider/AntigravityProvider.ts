@@ -52,8 +52,19 @@ const PublishingUsage = Context.Reference<boolean>("t3/provider/AntigravityPubli
 
 type SessionSetupResult = Pick<
   AcpSessionRuntime.AcpSessionRuntimeStartResult["sessionSetupResult"],
-  "configOptions" | "models"
+  "configOptions" | "models" | "_meta"
 >;
+
+/** agy reports the account's plan, such as "Google AI Pro", as `_meta.antigravity.tier` (`{ name, id }`) on `session/new`. */
+function antigravityTier(setup: Pick<SessionSetupResult, "_meta">): string | undefined {
+  const antigravity = setup._meta?.antigravity;
+  const tier =
+    typeof antigravity === "object" && antigravity !== null && "tier" in antigravity
+      ? antigravity.tier
+      : undefined;
+  const name = typeof tier === "object" && tier !== null && "name" in tier ? tier.name : tier;
+  return typeof name === "string" && name.trim() ? name.trim() : undefined;
+}
 
 type ThinkingConfig = NonNullable<ReturnType<typeof antigravityThinkingConfig>>;
 
@@ -155,10 +166,16 @@ interface AntigravityProviderState {
   readonly authRevision: number;
 }
 
+export interface AntigravityProbeResult {
+  readonly initialize: EffectAcpSchema.InitializeResponse;
+  /** The account is signed out: agy answered "Authentication required". */
+  readonly authRequired?: boolean;
+}
+
 interface AntigravityProviderOptions {
   readonly stampIdentity: (snapshot: ServerProviderDraft) => Effect.Effect<ServerProvider>;
   readonly probe: Effect.Effect<
-    EffectAcpSchema.InitializeResponse,
+    AntigravityProbeResult,
     EffectAcpErrors.AcpError | ProviderSetupError
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
@@ -182,6 +199,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const authUncheckedMessage = usesCredentials
     ? `Antigravity is installed. Connect with ${options.auth.label} to load models.`
     : AUTH_UNCHECKED_MESSAGE;
+  const unauthenticatedAuth = {
+    status: "unauthenticated",
+    ...(usesCredentials ? options.auth : {}),
+  } as const;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const nextVersion = (version: string | null) => ({
     version,
@@ -282,8 +303,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       Effect.timeoutOption(HEALTH_CHECK_TIMEOUT),
       Effect.result,
     );
-    const initialized =
+    const probed =
       Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
+    const initialized = probed?.initialize;
+    const authRequired = probed?.authRequired === true;
     const version = initialized?.agentInfo?.version;
     const failure = Result.isFailure(result) ? result.failure : undefined;
     const missingInstallation = failure !== undefined && isMissingInstallation(failure);
@@ -298,30 +321,37 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               ? "Antigravity could not complete its local health check."
               : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
     const supportsTextGeneration =
-      initialized !== undefined ? yield* options.supportsTextGeneration : false;
+      initialized !== undefined && !authRequired ? yield* options.supportsTextGeneration : false;
+    if (authRequired) {
+      yield* resetUsage;
+      discoveredSkills.clear();
+      thinkingLevels.clear();
+    }
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
-      const authenticated = draft.auth.status === "authenticated";
+      const auth = authRequired ? unauthenticatedAuth : draft.auth;
+      const authenticated = auth.status === "authenticated";
       const message =
         errorMessage ??
         (authenticated
           ? undefined
-          : draft.auth.status === "unauthenticated"
+          : auth.status === "unauthenticated"
             ? signInMessage
             : authUncheckedMessage);
       return {
         ...state,
         draft: {
           ...draft,
+          auth,
           installed: !missingInstallation,
           // Lightweight custom-launcher probes lack versions; preserve the real handshake's version.
           ...nextVersion(version === "unknown" ? draft.version : version || draft.version),
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
           checkedAt: updatedAt,
           usageLimits: missingInstallation ? undefined : draft.usageLimits,
-          ...(missingInstallation
+          ...(missingInstallation || authRequired
             ? {
                 models: [],
                 slashCommands: [],
@@ -332,15 +362,14 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             : {}),
           ...(initialized !== undefined
             ? {
-                supportsTextGeneration:
-                  supportsTextGeneration && draft.auth.status !== "unauthenticated",
+                supportsTextGeneration: supportsTextGeneration && auth.status !== "unauthenticated",
               }
             : {}),
           ...(message ? { message } : {}),
         },
       } satisfies AntigravityProviderState;
     });
-    if (initialized !== undefined) yield* refreshUsage();
+    if (initialized !== undefined && !authRequired) yield* refreshUsage();
     return yield* options.stampIdentity(next.draft);
   });
 
@@ -397,7 +426,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            label:
+              antigravityTier(started.sessionSetupResult) ??
+              options.auth?.label ??
+              "Google account",
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
@@ -478,10 +510,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           authRevision: state.authRevision + 1,
           draft: {
             ...state.draft,
-            auth: {
-              status: "unauthenticated",
-              ...(usesCredentials ? options.auth : {}),
-            },
+            auth: unauthenticatedAuth,
             status: "warning",
             message: signInMessage,
             checkedAt: updatedAt,

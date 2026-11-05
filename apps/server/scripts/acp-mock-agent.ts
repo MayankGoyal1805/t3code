@@ -598,6 +598,9 @@ const program = Effect.gen(function* () {
       return {
         sessionId,
         configOptions: configOptions(),
+        ...(antigravityProfile
+          ? { _meta: { antigravity: { tier: { name: "Google AI Pro", id: "g1-pro-tier" } } } }
+          : {}),
       };
     }),
   );

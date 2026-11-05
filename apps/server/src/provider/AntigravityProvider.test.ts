@@ -140,6 +140,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
   const initialProbe = yield* Deferred.make<EffectAcpSchema.InitializeResponse, ProbeError>();
   const probeCalls = yield* Ref.make(0);
   const safetyCalls = yield* Ref.make(0);
+  const authRequired = yield* Ref.make(false);
   const probe = yield* Ref.make<Effect.Effect<EffectAcpSchema.InitializeResponse, ProbeError>>(
     Deferred.await(initialProbe),
   );
@@ -153,6 +154,11 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       probe: Ref.update(probeCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(probe)),
         Effect.flatten,
+        Effect.flatMap((initialize) =>
+          Ref.get(authRequired).pipe(
+            Effect.map((required) => ({ initialize, authRequired: required })),
+          ),
+        ),
       ),
       supportsTextGeneration: Ref.update(safetyCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(safety)),
@@ -178,6 +184,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     provider,
     probe,
     probeCalls,
+    authRequired,
     safety,
     safetyCalls,
     initialProbe,
@@ -344,6 +351,57 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           });
           expect(yield* Ref.get(harness.probeCalls)).toBe(1);
         }
+      }),
+    ),
+  );
+
+  it.effect("labels an authenticated account with the plan agy reports", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        yield* harness.provider.onSessionStarted({
+          ...started,
+          sessionSetupResult: {
+            ...sessionSetupResult,
+            _meta: { antigravity: { tier: { name: "Google AI Pro", id: "g1-pro-tier" } } },
+          },
+        });
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          status: "ready",
+          auth: { status: "authenticated", type: "oauth-personal", label: "Google AI Pro" },
+        });
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.label).toBe("Google account");
+      }),
+    ),
+  );
+
+  it.effect("reports a signed-out account from the probe and clears the catalog", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* Ref.set(harness.authRequired, true);
+        yield* harness.initialize;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          installed: true,
+          status: "warning",
+          version: "1.5.1",
+          auth: { status: "unauthenticated" },
+          message: "Sign in with Google to use Antigravity.",
+          models: [],
+          supportsTextGeneration: false,
+        });
+        yield* Ref.set(harness.authRequired, false);
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).models).not.toEqual([]);
+        yield* Ref.set(harness.authRequired, true);
+        yield* harness.provider.snapshot.refresh;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          auth: { status: "unauthenticated" },
+          models: [],
+          supportsTextGeneration: false,
+        });
       }),
     ),
   );

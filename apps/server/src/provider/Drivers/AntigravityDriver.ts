@@ -2,7 +2,6 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import { AntigravitySettings, ProviderDriverKind, ProviderSetupError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
@@ -13,7 +12,6 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { HttpClient } from "effect/http";
 import type { AcpError } from "effect-acp/errors";
@@ -53,7 +51,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import { makeAntigravityAdapterV2 } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
-import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import { makeAntigravityProvider, type AntigravityProbeResult } from "../AntigravityProvider.ts";
 import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
@@ -63,11 +61,6 @@ import {
   resolveProviderMaintenanceCapabilitiesEffect,
   type ProviderMaintenanceCapabilitiesResolver,
 } from "@t3tools/provider-core/server/maintenanceResolver";
-import {
-  isCommandMissingCause,
-  parseGenericCliVersion,
-  spawnAndCollect,
-} from "@t3tools/provider-core/server/snapshotProbe";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
   defaultProviderContinuationIdentity,
@@ -182,7 +175,10 @@ export const AntigravityDriver: ProviderDriver<
       );
 
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner">,
+      input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner"> & {
+        /** A probe reports a signed-out account in its result, not through the account state. */
+        readonly silentAuthRequired?: boolean;
+      },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
       AcpError | ProviderSetupError,
@@ -249,7 +245,9 @@ export const AntigravityDriver: ProviderDriver<
             .start()
             .pipe(
               Effect.tapError((cause): Effect.Effect<void> =>
-                input.onAuthorizationUrl === undefined && isAntigravitySignInRequiredError(cause)
+                input.onAuthorizationUrl === undefined &&
+                input.silentAuthRequired !== true &&
+                isAntigravitySignInRequiredError(cause)
                   ? provider.onAuthRequired
                   : Effect.void,
               ),
@@ -258,7 +256,9 @@ export const AntigravityDriver: ProviderDriver<
     });
 
     const makeDisposableRuntime = Effect.fn("AntigravityDriver.makeDisposableRuntime")(function* (
-      input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl">,
+      input: Pick<AntigravityAcpRuntimeInput, "onAuthorizationUrl"> & {
+        readonly silentAuthRequired?: boolean;
+      },
     ) {
       const cwd = yield* fileSystem
         .makeTempDirectoryScoped({ prefix: "t3-antigravity-setup-" })
@@ -283,6 +283,7 @@ export const AntigravityDriver: ProviderDriver<
         cwd,
         mcpServers: [],
         ...(input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {}),
+        ...(input.silentAuthRequired ? { silentAuthRequired: true } : {}),
       });
       return {
         ...runtime,
@@ -303,7 +304,7 @@ export const AntigravityDriver: ProviderDriver<
         AcpSessionRuntime.AcpSessionRuntime["Service"],
         "getEvents" | "drainEvents" | "setModel"
       >,
-    ) {
+    ): Effect.fn.Return<void, never, Scope.Scope> {
       yield* provider.onSessionStarted(started);
       yield* Stream.runForEach(runtime.getEvents(), (event) => {
         if (event._tag === "EventStreamBarrier") {
@@ -339,7 +340,11 @@ export const AntigravityDriver: ProviderDriver<
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),
     });
 
-    const probe = Effect.gen(function* () {
+    // One throwaway session reads sign-in state, plan, and models; agy answers it in milliseconds.
+    const probe = Effect.fn("AntigravityDriver.probe")(function* (): Effect.fn.Return<
+      AntigravityProbeResult,
+      AcpError | ProviderSetupError
+    > {
       yield* modelCatalog.refreshInBackground;
       if (authConfigIssue !== null) {
         return yield* new ProviderSetupError({
@@ -348,44 +353,17 @@ export const AntigravityDriver: ProviderDriver<
           detail: authConfigIssue,
         });
       }
-      const spawnCommand = yield* resolveSpawnCommand(settings.binaryPath, ["--version"], {
-        env: processEnvironment,
-      });
-      const output = yield* spawnAndCollect(
-        settings.binaryPath,
-        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-          env: processEnvironment,
-          shell: spawnCommand.shell,
-        }),
-      ).pipe(
-        Effect.timeout("20 seconds"),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.mapError(
-          (cause) =>
-            new ProviderSetupError({
-              instanceId,
-              operation: isCommandMissingCause(cause) ? "resolve" : "start",
-              detail: isCommandMissingCause(cause)
-                ? "The Antigravity CLI (agy) is not installed or could not be found. Install it, or set its path in the Antigravity provider settings."
-                : "Could not run `agy --version`.",
-              cause,
-            }),
-        ),
-      );
-      return {
-        protocolVersion: 1,
-        agentCapabilities: {
-          loadSession: true,
-          promptCapabilities: { image: true, audio: false, embeddedContext: true },
-          sessionCapabilities: { list: {}, resume: {} },
-        },
-        authMethods: [{ id: "oauth-personal", name: "Log in with Google" }],
-        agentInfo: {
-          name: "agy",
-          title: "Google Antigravity",
-          version: parseGenericCliVersion(`${output.stdout}\n${output.stderr}`) ?? "unknown",
-        },
-      };
+      return yield* Effect.gen(function* () {
+        const runtime = yield* makeDisposableRuntime({ silentAuthRequired: true });
+        const initialize = yield* runtime.initialize();
+        return yield* runtime.start().pipe(
+          Effect.flatMap((started) => publishCatalog(started, runtime)),
+          Effect.as({ initialize }),
+          Effect.catchIf(isAntigravitySignInRequiredError, () =>
+            Effect.succeed({ initialize, authRequired: true }),
+          ),
+        );
+      }).pipe(Effect.scoped);
     });
 
     const usage = yield* makeAntigravityUsageProbe({
@@ -400,7 +378,7 @@ export const AntigravityDriver: ProviderDriver<
     const provider = yield* makeAntigravityProvider(settings, {
       stampIdentity: classifyModels,
       resolveMaintenance,
-      probe,
+      probe: probe(),
       probeUsage: usage.probe,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },

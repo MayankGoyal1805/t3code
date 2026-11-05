@@ -136,7 +136,20 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       if (launch.cwd && launch.args[0] === "acp") expect(yield* fs.exists(launch.cwd)).toBe(false);
     }
   });
-  return { instance, refresh, executablePath, launches, readRequests, assertClosed };
+  // The instance probes once on startup; settle it so each test sees only its own processes.
+  yield* instance.snapshot.refresh;
+  const startupRequests = (yield* readRequests).map((request) => request.method);
+  launches.length = 0;
+  yield* fs.remove(requestLog, { force: true });
+  return {
+    instance,
+    refresh,
+    executablePath,
+    launches,
+    readRequests,
+    startupRequests,
+    assertClosed,
+  };
 });
 
 const layerDeps = ServerConfig.layerTest(process.cwd(), {
@@ -204,14 +217,35 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect.skipIf(windowsHost)("reads the version from `agy --version`", () =>
+  it.effect.skipIf(windowsHost)("reports sign-in, plan, and models from a throwaway session", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();
-      yield* h.instance.snapshot.refresh;
       const snapshot = yield* h.instance.snapshot.getSnapshot;
-      expect(snapshot.installed).toBe(true);
-      expect(snapshot.version).toBe("1.5.1");
-      expect(h.launches.map((launch) => launch.args)).toContainEqual(["--version"]);
+      expect(snapshot).toMatchObject({
+        installed: true,
+        status: "ready",
+        auth: { status: "authenticated", type: "oauth-personal", label: "Google AI Pro" },
+      });
+      expect(snapshot.models.map((model) => model.slug)).toEqual([
+        "gemini-test-low",
+        "gemini-test-high",
+      ]);
+      expect(h.startupRequests.slice(0, 2)).toEqual(["initialize", "session/new"]);
+      yield* h.assertClosed;
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)("reports a signed-out account from the health check", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ signedOut: true });
+      expect(yield* h.instance.snapshot.getSnapshot).toMatchObject({
+        installed: true,
+        status: "warning",
+        auth: { status: "unauthenticated" },
+        message: "Sign in with Google to use Antigravity.",
+        models: [],
+      });
+      yield* h.assertClosed;
     }).pipe(Effect.scoped),
   );
 
