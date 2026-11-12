@@ -57,6 +57,14 @@ describe("Antigravity spawn input", () => {
     ]);
   });
 
+  it("hands conversational runtimes the hook events file", () => {
+    expect(spawnInput().env).toEqual({ PATH: "/usr/bin" });
+    expect(spawnInput({ hookEventsFile: "/tmp/hooks/events" }).env).toEqual({
+      PATH: "/usr/bin",
+      T3CODE_AGY_HOOK_EVENTS: "/tmp/hooks/events",
+    });
+  });
+
   it("passes the user's credentials through and drops only ELECTRON_RUN_AS_NODE", () => {
     const env = spawnInput({
       baseEnv: {

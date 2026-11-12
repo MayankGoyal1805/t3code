@@ -6,6 +6,7 @@ import * as Schema from "effect/Schema";
 import * as AcpErrors from "effect-acp/errors";
 
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import { ANTIGRAVITY_HOOK_EVENTS_ENV } from "./acp/AntigravityHooks.ts";
 
 export const ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE =
   "Sign in to Antigravity in Settings before you continue.";
@@ -117,9 +118,16 @@ export function buildAntigravityAcpSpawnInput(input: {
   readonly auth: AntigravityAuthConfig;
   /** Sign-in only: a directory whose `xdg-open` and `open` hand the URL to T3 Code. */
   readonly browserCaptureDirectory?: string;
+  /** Conversational runtimes: the file agy's `t3-code` hook appends to; without it the hook does nothing. */
+  readonly hookEventsFile?: string;
   readonly platform: NodeJS.Platform;
 }): AcpSessionRuntime.AcpSpawnInput {
-  const environment = antigravityEnvironment(input.baseEnv, input.auth);
+  const environment: NodeJS.ProcessEnv = {
+    ...antigravityEnvironment(input.baseEnv, input.auth),
+    ...(input.hookEventsFile === undefined
+      ? {}
+      : { [ANTIGRAVITY_HOOK_EVENTS_ENV]: input.hookEventsFile }),
+  };
   const capture = input.browserCaptureDirectory;
   const pathKey = Object.keys(environment).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
   return {

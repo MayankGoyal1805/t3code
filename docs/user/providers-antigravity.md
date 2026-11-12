@@ -91,6 +91,19 @@ you cannot message or control individual subagents, and an idle batch does not c
 child succeeded. If Antigravity did not record which children a batch started, the view says so.
 See [agent work](./thread-sidebar.md#inspect-agent-work) for where to inspect activity.
 
+### Background commands and timers
+
+When Antigravity starts a command in the background or sets a timer (`/schedule`), the card keeps
+running after the turn ends. When the task finishes, the card completes with its output and the
+agent's follow-up appears in the thread as a new run, without you sending anything. Ending a turn
+with **Stop** drops tasks it was following.
+
+To hear about these, T3 Code adds a `t3-code` entry to `config/hooks.json` in the instance's Gemini
+directory. For the default instance that is `~/.gemini/config/hooks.json`, which the `agy` CLI
+also reads. The entry does nothing outside T3 Code. If the file is not valid JSON, T3 Code leaves
+it alone and background tasks are not followed. Tasks do not report back if `agy` exits before
+they finish.
+
 ## Accounts and updates
 
 By default Antigravity shares its sign-in and conversations with the `agy` CLI in `~/.gemini`.

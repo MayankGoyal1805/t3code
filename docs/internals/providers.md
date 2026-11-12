@@ -136,7 +136,18 @@ Capabilities must describe what the provider can actually do. Antigravity has no
 `agy`'s private conversation database and reloads it. That storage is undocumented, so rollback is
 gated to tested `agy` versions; elsewhere revert restores files and the next turn starts a fresh
 session. The subagent and turn-outcome readers decode the same private SQLite and protobuf data and
-are equally version-sensitive; they must degrade to no data, not fail the turn. The
+are equally version-sensitive; they must degrade to no data, not fail the turn. ACP v1 has no
+agent-initiated turns, and `agy` sends nothing when a background command or timer ends or when the
+model follows up on it. Its documented hooks are the push signal: the [hooks
+module](../../apps/server/src/provider/acp/AntigravityHooks.ts) registers a `t3-code` entry in the
+profile's `config/hooks.json` whose one-line command appends each hook payload to a file named by
+`T3CODE_AGY_HOOK_EVENTS`, which only conversational runtimes set. The
+[follower](../../apps/server/src/provider/acp/AntigravityBackground.ts) turns those events plus the
+transcript the hook points at (the content source, plain JSONL) into synthetic ACP updates marked
+as wakes, so the shared adapter's post-settle continuation path starts the new run. A wake is a
+`PreInvocation` with no prompt in flight after a background task's `PostToolUse`; that is what
+separates it from a subagent wake, which the session-log tracker owns. Background tasks pin the
+session but never hold the turn open. The
 [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
 rejects revert before touching files when a provider reports no rollback support. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.

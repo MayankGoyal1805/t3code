@@ -15,6 +15,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
@@ -36,6 +37,14 @@ import {
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "../../provider/acp/AntigravityChildWork.ts";
+import {
+  ANTIGRAVITY_WAKE_META,
+  isAntigravityBackgroundToolName,
+  makeAntigravityBackgroundFollower,
+} from "../../provider/acp/AntigravityBackground.ts";
+import { tailAntigravityHookEvents } from "../../provider/acp/AntigravityHookEvents.ts";
+import { ensureAntigravityHooks } from "../../provider/acp/AntigravityHooks.ts";
+import { readAntigravityTranscript } from "../../provider/acp/AntigravityTranscript.ts";
 import { rollbackAntigravityConversationOffThread } from "../../provider/acp/AntigravityRollback.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
@@ -91,7 +100,10 @@ export interface AntigravityAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
   readonly selfInvocation: SelfInvocation;
   readonly makeRuntime: (
-    input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner">,
+    input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner"> & {
+      /** The file agy's `t3-code` hook appends to; set only for conversational runtimes. */
+      readonly hookEventsFile?: string;
+    },
   ) => Effect.Effect<
     AcpSessionRuntime.AcpSessionRuntime["Service"],
     EffectAcpErrors.AcpError | ProviderSetupError,
@@ -110,6 +122,8 @@ export interface AntigravityAdapterV2Options {
   readonly version?: Effect.Effect<string | undefined>;
   /** The Gemini directory that holds agy's `antigravity-cli` data. Its conversations show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
+  /** Follow background commands and timers through agy's hooks; needs `profileDirectory` and a POSIX shell. */
+  readonly followBackgroundWork?: boolean;
 }
 
 /** Marks the update that carries a subagent's report: agy streams none, so the session log supplies it. */
@@ -312,10 +326,124 @@ function followSubagentWake(
   };
 }
 
+/** The transcript can trail the Stop hook by a moment; a few re-reads, never a loop that runs on. */
+const TRANSCRIPT_RETRY_DELAY = "500 millis";
+const TRANSCRIPT_MAX_READS = 6;
+
+/**
+ * agy reports nothing when a background command or timer ends, or for the follow-up it then runs.
+ * Its `t3-code` hook appends each event to `eventsFile`; this turns them, with the transcript the
+ * hooks point at, into the updates the protocol would have carried (see AntigravityBackground).
+ */
+function followBackgroundWork(
+  runtime: AntigravityRuntime,
+  scope: Scope.Scope,
+  fileSystem: FileSystem.FileSystem,
+  eventsFile: string,
+): AntigravityRuntime {
+  const follower = makeAntigravityBackgroundFollower();
+  let deliver: Parameters<AntigravityRuntime["handleSessionUpdate"]>[0] | undefined;
+  let rootSessionId: string | undefined;
+  let tailing = false;
+
+  const send = (updates: ReadonlyArray<EffectAcpSchema.SessionUpdate>) =>
+    Effect.forEach(
+      updates,
+      (update) =>
+        rootSessionId === undefined
+          ? Effect.void
+          : (deliver?.({ sessionId: rootSessionId, update }) ?? Effect.void).pipe(Effect.ignore),
+      { discard: true },
+    );
+
+  const followTranscript = Effect.fn("AntigravityAdapterV2.followTranscript")(function* (
+    transcriptPath: string,
+  ) {
+    for (let read = 0; read < TRANSCRIPT_MAX_READS; read++) {
+      const steps = yield* readAntigravityTranscript(transcriptPath, 0).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+      );
+      const result = follower.transcript(steps);
+      yield* send(result.updates);
+      if (!result.incomplete) return;
+      yield* Effect.sleep(TRANSCRIPT_RETRY_DELAY);
+    }
+  });
+
+  const onHook = Effect.fn("AntigravityAdapterV2.followBackgroundHook")(function* (
+    event: Parameters<typeof follower.hook>[0],
+  ) {
+    const step = follower.hook(event);
+    yield* send(step.updates);
+    if (step.read !== undefined) yield* followTranscript(step.read.transcriptPath);
+  });
+
+  const started = <A extends { readonly sessionId: string }, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    effect.pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          rootSessionId = result.sessionId;
+          follower.sessionStarted(result.sessionId);
+        }),
+      ),
+    );
+
+  return {
+    ...runtime,
+    start: () => started(runtime.start()),
+    loadSession: (sessionId, activation) => started(runtime.loadSession(sessionId, activation)),
+    resumeSession: (sessionId, activation) => started(runtime.resumeSession(sessionId, activation)),
+    handleSessionUpdate: Effect.fn("AntigravityAdapterV2.followBackgroundUpdates")(
+      function* (handler) {
+        deliver = handler;
+        if (!tailing) {
+          tailing = true;
+          yield* tailAntigravityHookEvents(eventsFile).pipe(
+            Stream.runForEach(onHook),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.forkIn(scope),
+          );
+        }
+        return yield* runtime.handleSessionUpdate((notification) =>
+          Effect.sync(() => {
+            const { update } = notification;
+            if (
+              notification.sessionId === rootSessionId &&
+              (update.sessionUpdate === "tool_call" ||
+                update.sessionUpdate === "tool_call_update") &&
+              isAntigravityBackgroundToolName(update.name)
+            ) {
+              follower.toolObserved({
+                toolCallId: update.toolCallId,
+                name: update.name,
+                rawInput: update.rawInput,
+                status:
+                  update.status === "completed" || update.status === "failed" ? "settled" : "open",
+              });
+            }
+          }).pipe(Effect.andThen(handler(notification))),
+        );
+      },
+    ),
+    prompt: (payload, options) =>
+      Effect.sync(() => follower.promptStarted()).pipe(
+        Effect.andThen(runtime.prompt(payload, options)),
+        Effect.ensuring(Effect.sync(() => follower.promptReturned())),
+      ),
+    cancel: Effect.sync(() => follower.abandon()).pipe(Effect.andThen(runtime.cancel)),
+  };
+}
+
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  const followsBackgroundWork =
+    options.followBackgroundWork === true && profileDirectory !== undefined;
+  // Tasks are tracked only once hooks are registered; otherwise nothing would ever end them.
+  let backgroundHooksLive = false;
   const missingConversation = (sessionId: string) =>
     new EffectAcpErrors.AcpRequestError({
       code: -32002,
@@ -335,6 +463,24 @@ export function makeAntigravityAcpAdapterFlavor(
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       const scope = yield* Scope.fork(yield* Effect.scope);
+      const hookEventsFile =
+        followsBackgroundWork &&
+        (yield* ensureAntigravityHooks(profileDirectory).pipe(
+          Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+          Effect.provideService(Path.Path, options.path),
+        ))
+          ? yield* options.fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-hooks-" }).pipe(
+              Effect.map((directory) => options.path.join(directory, "events")),
+              Effect.tap((file) => options.fileSystem.writeFileString(file, "")),
+              Effect.provideService(Scope.Scope, scope),
+              Effect.catch((cause) =>
+                Effect.logWarning("Could not prepare the Antigravity hook events file.", {
+                  cause,
+                }).pipe(Effect.as(undefined)),
+              ),
+            )
+          : undefined;
+      if (hookEventsFile !== undefined) backgroundHooksLive = true;
       const runtime = yield* options
         .withProcess(
           Scope.close(scope, Exit.void),
@@ -342,29 +488,34 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
             additionalDirectories: [options.host.paths.attachmentsDir],
+            ...(hookEventsFile === undefined ? {} : { hookEventsFile }),
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
+      const background =
+        hookEventsFile === undefined
+          ? runtime
+          : followBackgroundWork(runtime, scope, options.fileSystem, hookEventsFile);
       const followed =
         profileDirectory === undefined
-          ? runtime
-          : followSubagentWake(runtime, scope, profileDirectory);
+          ? background
+          : followSubagentWake(background, scope, profileDirectory);
       return {
         ...followed,
         loadSession: (sessionId, activation) =>
           requireConversation(sessionId).pipe(
-            Effect.andThen(runtime.loadSession(sessionId, activation)),
+            Effect.andThen(background.loadSession(sessionId, activation)),
           ),
         resumeSession: (sessionId, activation) =>
           requireConversation(sessionId).pipe(
-            Effect.andThen(runtime.resumeSession(sessionId, activation)),
+            Effect.andThen(background.resumeSession(sessionId, activation)),
           ),
         start: () =>
           (input.resumeSessionId === undefined
             ? Effect.void
             : requireConversation(input.resumeSessionId)
           ).pipe(
-            Effect.andThen(runtime.start()),
+            Effect.andThen(background.start()),
             Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
           ),
       } satisfies typeof runtime;
@@ -416,6 +567,22 @@ export function makeAntigravityAcpAdapterFlavor(
     // Without the session log a launch's report never arrives, so its turn must not wait for one.
     subagentsIdleOnTurnCompletion: true,
     deferFinalizeForBackgroundWork: profileDirectory !== undefined,
+    ...(followsBackgroundWork
+      ? {
+          enablePostSettleContinuation: true,
+          // Commands and timers outlive the turn: they pin the session but never hold the run open.
+          extractBackgroundTaskId: (toolCall) =>
+            backgroundHooksLive && isAntigravityBackgroundToolName(toolCall.data.name)
+              ? toolCall.toolCallId
+              : undefined,
+          isPersistentBackgroundTool: () => true,
+          isProviderWakeNotification: (notification) => {
+            const meta: unknown =
+              "_meta" in notification.update ? notification.update._meta : undefined;
+            return Predicate.isObject(meta) && meta[ANTIGRAVITY_WAKE_META] === true;
+          },
+        }
+      : {}),
     ...(options.onSessionEvent === undefined ? {} : { onSessionEvent: options.onSessionEvent }),
     applyModelSelection: Effect.fn("AntigravityAdapterV2.applyModelSelection")(function* ({
       runtime,

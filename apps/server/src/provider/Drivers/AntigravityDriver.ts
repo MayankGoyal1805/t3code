@@ -184,6 +184,8 @@ export const AntigravityDriver: ProviderDriver<
       input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner"> & {
         /** A probe reports a signed-out account in its result, not through the account state. */
         readonly silentAuthRequired?: boolean;
+        /** Conversational runtimes only; see buildAntigravityAcpSpawnInput. */
+        readonly hookEventsFile?: string;
       },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
@@ -242,6 +244,7 @@ export const AntigravityDriver: ProviderDriver<
           baseEnv: processEnvironment,
           auth,
           platform,
+          ...(input.hookEventsFile === undefined ? {} : { hookEventsFile: input.hookEventsFile }),
           ...(browserCapture === undefined
             ? {}
             : { browserCaptureDirectory: browserCapture.directory }),
@@ -420,6 +423,7 @@ export const AntigravityDriver: ProviderDriver<
         Effect.map((snapshot) => snapshot.version ?? undefined),
       ),
       profileDirectory: geminiDirectory,
+      followBackgroundWork: platform !== "win32",
       onSessionStarted: provider.onSessionStarted,
       onSessionEvent: (event) => {
         if (event._tag === "ConfigOptionsUpdated") {

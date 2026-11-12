@@ -12,6 +12,7 @@ import * as Stream from "effect/Stream";
 import { type AcpError, AcpRequestError } from "effect-acp/errors";
 
 import { applyAntigravityAcpModelSelection } from "../provider/acp/AntigravityAcpSupport.ts";
+import { withoutAntigravityHook } from "../provider/acp/AntigravityHooks.ts";
 import { removeAntigravityConversation } from "../provider/Drivers/AntigravityHome.ts";
 import {
   ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
@@ -92,7 +93,12 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
           configuration[name === "hooks.json" ? "hooks" : "mcpServers"] ?? configuration,
         ),
       ),
-      Effect.map((configuration) => Object.keys(configuration).length === 0),
+      Effect.map(
+        (configuration) =>
+          // T3 Code's own background-work hook is inert outside its conversations.
+          Object.keys(name === "hooks.json" ? withoutAntigravityHook(configuration) : configuration)
+            .length === 0,
+      ),
       Effect.orElseSucceed(() => false),
     );
     if (!empty) return false;

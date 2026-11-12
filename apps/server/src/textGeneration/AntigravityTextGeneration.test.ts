@@ -539,6 +539,12 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
     { name: "hooks.json", value: "invalid JSON", available: false },
     { name: "mcp_config.json", value: "x".repeat(64_001), available: false },
     { name: "hooks.json", value: "{}", available: true },
+    { name: "hooks.json", value: '{"t3-code":{"Stop":[{"command":"x"}]}}', available: true },
+    {
+      name: "hooks.json",
+      value: '{"t3-code":{"Stop":[]},"mine":{"Stop":[{"command":"x"}]}}',
+      available: false,
+    },
     { name: "hooks.json", value: '{"hooks":{}}', available: true },
     { name: "mcp_config.json", value: '{"mcpServers":{}}', available: true },
   ])("checks $name before starting a helper, available=$available", ({ name, value, available }) =>
