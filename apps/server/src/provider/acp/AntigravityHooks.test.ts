@@ -74,6 +74,7 @@ describe("ensureAntigravityHooks", () => {
       assert.deepEqual(Object.keys(JSON.parse(first)), ["mine", ANTIGRAVITY_HOOK_NAME]);
       assert.isTrue(yield* ensureAntigravityHooks(directory));
       assert.equal(yield* fs.readFileString(file), first);
+      assert.deepEqual(yield* fs.readDirectory(`${directory}/config`), ["hooks.json"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

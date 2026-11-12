@@ -350,6 +350,15 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           fs: { readTextFile: false, writeTextFile: false },
           elicitation: { form: {} },
         });
-      }).pipe(Effect.scoped),
+        // Opened sessions register agy hooks in the Gemini directory, which must not be the real ~/.gemini.
+      }).pipe(
+        Effect.provideServiceEffect(
+          HostProcess.HomeDirectory,
+          FileSystem.FileSystem.pipe(
+            Effect.flatMap((fs) => fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-home-" })),
+          ),
+        ),
+        Effect.scoped,
+      ),
   );
 });

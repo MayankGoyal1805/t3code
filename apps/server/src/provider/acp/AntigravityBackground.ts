@@ -107,6 +107,8 @@ export function makeAntigravityBackgroundFollower() {
   let pendingWakes = 0;
   let wake: Wake | undefined;
   let cursor = -1;
+  /** Finished while no prompt ran: reported with the wake's follow-up so one run carries both. */
+  let held: Array<{ readonly tool: TrackedTool; readonly error: string | null | undefined }> = [];
   let transcriptPath: string | undefined;
   const tools = new Map<string, TrackedTool>();
   const knownMessages = new Map<
@@ -170,6 +172,12 @@ export function makeAntigravityBackgroundFollower() {
       },
       "tool_call_update",
     );
+  };
+
+  const flushHeld = (): SessionUpdate[] => {
+    const finished = held;
+    held = [];
+    return finished.map(({ tool, error }) => complete(tool, error));
   };
 
   const confirmBackground = () => {
@@ -270,6 +278,7 @@ export function makeAntigravityBackgroundFollower() {
       wake = undefined;
       pendingWakes = 0;
       cursor = -1;
+      held = [];
       knownMessages.clear();
     },
 
@@ -305,12 +314,54 @@ export function makeAntigravityBackgroundFollower() {
     },
 
     /** Stop or a failed prompt: nothing agy does afterwards belongs to a run T3 Code is showing. */
-    abandon() {
+    abandon(): ReadonlyArray<SessionUpdate> {
+      const updates = this.failUnconfirmed("The command was interrupted.");
       promptInFlight = false;
       busyStopDuringPrompt = false;
       wake = undefined;
       pendingWakes = 0;
+      held = [];
       tools.clear();
+      return updates;
+    },
+
+    /** A prompt that did not end normally: commands still open were never backgrounded, so they end with it. */
+    failUnconfirmed(reason: string): ReadonlyArray<SessionUpdate> {
+      const updates: SessionUpdate[] = [];
+      for (const tool of tools.values()) {
+        if (tool.done || tool.background) continue;
+        tool.done = true;
+        updates.push(toolUpdate(tool, { status: "failed", rawOutput: reason }, "tool_call_update"));
+      }
+      return updates;
+    },
+
+    /** The runtime is going away: during a prompt, every task it was tracking is lost with it. */
+    lost(): ReadonlyArray<SessionUpdate> {
+      if (!promptInFlight) return [];
+      const updates: SessionUpdate[] = [];
+      for (const tool of tools.values()) {
+        if (tool.done) continue;
+        tool.done = true;
+        updates.push(
+          toolUpdate(
+            tool,
+            { status: "failed", rawOutput: "agy stopped before this task reported." },
+            "tool_call_update",
+          ),
+        );
+      }
+      return updates;
+    },
+
+    /** Completions still waiting for a wake that has not finished. */
+    holding(): boolean {
+      return held.length > 0;
+    },
+
+    /** Reports held completions without a follow-up, when the wake never finishes. */
+    flush(): ReadonlyArray<SessionUpdate> {
+      return flushHeld();
     },
 
     pendingToolCallIds(): ReadonlyArray<string> {
@@ -337,8 +388,10 @@ export function makeAntigravityBackgroundFollower() {
           if (tool === undefined) return { updates: [] };
           tool.done = true;
           tool.stepIdx = event.stepIdx;
-          if (!promptInFlight) pendingWakes += 1;
-          return { updates: [complete(tool, event.error)], ...read };
+          if (promptInFlight) return { updates: [complete(tool, event.error)] };
+          pendingWakes += 1;
+          held.push({ tool, error: event.error });
+          return { updates: [] };
         }
         case "PreInvocation": {
           if (!promptInFlight && wake === undefined && pendingWakes > 0) {
@@ -377,18 +430,20 @@ export function makeAntigravityBackgroundFollower() {
         const message = parseAntigravityTaskMessage(step.content);
         if (message !== undefined) knownMessages.set(message.stepIdx, message);
       }
-      const updates = fillOutputs();
-      if (wake === undefined || !wake.stopped) return { updates, incomplete: false };
+      if (wake === undefined || !wake.stopped) return { updates: fillOutputs(), incomplete: false };
       const fresh = steps.filter((step) => step.step_index >= wake!.from);
       const triggered = fresh.findIndex((step) => step.type === "SYSTEM_MESSAGE");
       const answered = fresh
         .slice(Math.max(0, triggered))
         .some((step) => step.type === "PLANNER_RESPONSE");
-      if (!answered) return { updates, incomplete: true };
+      if (!answered) return { updates: [], incomplete: true };
       const { from, fullyIdle } = wake;
       wake = undefined;
       if (fullyIdle) pendingWakes = 0;
-      return { updates: [...updates, ...followUp(fresh, from)], incomplete: false };
+      return {
+        updates: [...flushHeld(), ...fillOutputs(), ...followUp(fresh, from)],
+        incomplete: false,
+      };
     },
   };
 }

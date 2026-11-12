@@ -120,23 +120,14 @@ const isWake = (update: object) =>
   (update as { _meta?: Record<string, unknown> })._meta?.[ANTIGRAVITY_WAKE_META] === true;
 
 describe("AntigravityBackgroundFollower", () => {
-  it("completes a background command at its hook and delivers the follow-up as a wake", () => {
+  it("holds a finished task until its wake ends, then delivers card and follow-up together", () => {
     const follower = launched({ id: "call_1", args: ONE });
     assert.deepEqual(follower.pendingToolCallIds(), ["call_1"]);
 
-    const done = follower.hook(postToolUse(2, ONE));
-    assert.deepEqual(summarize(done.updates), [["tool_call_update", "call_1", "completed"]]);
-    assert.isTrue(done.updates.every(isWake));
-    assert.equal(done.read?.transcriptPath, TRANSCRIPT_PATH);
+    // Nothing is reported while the model is still working on its follow-up.
+    assert.deepEqual(follower.hook(postToolUse(2, ONE)).updates, []);
+    assert.isTrue(follower.holding());
     assert.deepEqual(follower.pendingToolCallIds(), []);
-
-    // The task output is filled in from the transcript once it has the finished-task message.
-    const early = follower.transcript(transcript(launchSteps, firstWake.slice(0, 1)));
-    assert.deepEqual(
-      early.updates.map((update) => (update as { rawOutput?: unknown }).rawOutput),
-      [{ combinedOutput: "ONE", exitCode: 0 }],
-    );
-
     assert.deepEqual(
       follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 })).updates,
       [],
@@ -147,10 +138,23 @@ describe("AntigravityBackgroundFollower", () => {
     const result = follower.transcript(transcript(launchSteps, firstWake));
     assert.isFalse(result.incomplete);
     assert.deepEqual(summarize(result.updates), [
+      ["tool_call_update", "call_1", "completed"],
       ["agent_message_chunk", "The first command has finished.\n\nONE", null],
     ]);
+    assert.deepEqual((result.updates[0] as { rawOutput?: unknown }).rawOutput, {
+      combinedOutput: "ONE",
+      exitCode: 0,
+    });
     assert.isTrue(result.updates.every(isWake));
+    assert.isFalse(follower.holding());
     assert.deepEqual(follower.transcript(transcript(launchSteps, firstWake)).updates, []);
+  });
+
+  it("reports a held completion on its own when the wake never ends", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    follower.hook(postToolUse(2, ONE));
+    assert.deepEqual(summarize(follower.flush()), [["tool_call_update", "call_1", "completed"]]);
+    assert.deepEqual(follower.flush(), []);
   });
 
   it("follows two tasks in turn and strips the goal marker", () => {
@@ -159,22 +163,19 @@ describe("AntigravityBackgroundFollower", () => {
     follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 }));
     follower.hook(hook("Stop", { fullyIdle: false }));
     const first = follower.transcript(transcript(launchSteps, firstWake));
-    assert.deepEqual(summarize(first.updates).at(-1), [
-      "agent_message_chunk",
-      "The first command has finished.\n\nONE",
-      null,
-    ]);
+    assert.deepEqual(
+      summarize(first.updates).map((update) => update[0]),
+      ["tool_call_update", "agent_message_chunk"],
+    );
     assert.deepEqual(follower.pendingToolCallIds(), ["call_2"]);
 
-    const done = follower.hook(postToolUse(3, TWO));
-    assert.deepEqual(summarize(done.updates), [["tool_call_update", "call_2", "completed"]]);
+    follower.hook(postToolUse(3, TWO));
     follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 7 }));
     follower.hook(hook("Stop", { fullyIdle: true }));
     const second = follower.transcript(transcript(launchSteps, firstWake, secondWake));
-    assert.deepEqual(summarize(second.updates).at(-1), [
-      "agent_message_chunk",
-      "The second command has finished.\n\nTWO",
-      null,
+    assert.deepEqual(summarize(second.updates), [
+      ["tool_call_update", "call_2", "completed"],
+      ["agent_message_chunk", "The second command has finished.\n\nTWO", null],
     ]);
     assert.deepEqual(follower.pendingToolCallIds(), []);
   });
@@ -182,8 +183,7 @@ describe("AntigravityBackgroundFollower", () => {
   it("follows a schedule timer", () => {
     const args = { DurationSeconds: 20, Prompt: "Reply with the single word PING" };
     const follower = launched({ id: "call_s", name: "schedule", args });
-    const done = follower.hook(postToolUse(2, args, "schedule"));
-    assert.deepEqual(summarize(done.updates), [["tool_call_update", "call_s", "completed"]]);
+    follower.hook(postToolUse(2, args, "schedule"));
     follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 4 }));
     follower.hook(hook("Stop", { fullyIdle: true }));
     const result = follower.transcript(
@@ -197,7 +197,10 @@ describe("AntigravityBackgroundFollower", () => {
         { step_index: 5, type: "PLANNER_RESPONSE", status: "DONE", content: "PING" },
       ]),
     );
-    assert.deepEqual(summarize(result.updates), [["agent_message_chunk", "PING", null]]);
+    assert.deepEqual(summarize(result.updates), [
+      ["tool_call_update", "call_s", "completed"],
+      ["agent_message_chunk", "PING", null],
+    ]);
   });
 
   it("leaves subagent wakes and foreign conversations alone", () => {
@@ -294,8 +297,8 @@ describe("AntigravityBackgroundFollower", () => {
       ["tool_call_update", `agy-${ROOT}-6-0`, "completed"],
     ]);
     assert.deepEqual(follower.pendingToolCallIds(), [`agy-${ROOT}-6-1`]);
-    const done = follower.hook(postToolUse(8, THREE));
-    assert.deepEqual(summarize(done.updates), [
+    follower.hook(postToolUse(8, THREE));
+    assert.deepEqual(summarize(follower.flush()), [
       ["tool_call_update", `agy-${ROOT}-6-1`, "completed"],
     ]);
   });
@@ -304,6 +307,32 @@ describe("AntigravityBackgroundFollower", () => {
     const follower = launched({ id: "call_1", args: ONE });
     follower.abandon();
     assert.deepEqual(follower.hook(postToolUse(2, ONE)).updates, []);
+  });
+
+  it("ends a command that was never backgrounded when its prompt fails", () => {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    follower.toolObserved({
+      toolCallId: "call_1",
+      name: "run_command",
+      rawInput: ONE,
+      status: "open",
+    });
+    assert.deepEqual(summarize(follower.failUnconfirmed("The turn failed.")), [
+      ["tool_call_update", "call_1", "failed"],
+    ]);
+    assert.deepEqual(follower.failUnconfirmed("again"), []);
+
+    const backgrounded = launched({ id: "call_2", args: TWO });
+    assert.deepEqual(backgrounded.failUnconfirmed("x"), []);
+  });
+
+  it("marks tasks lost only while a prompt can show it", () => {
+    const idle = launched({ id: "call_1", args: ONE });
+    assert.deepEqual(idle.lost(), []);
+    idle.promptStarted();
+    assert.deepEqual(summarize(idle.lost()), [["tool_call_update", "call_1", "failed"]]);
   });
 });
 

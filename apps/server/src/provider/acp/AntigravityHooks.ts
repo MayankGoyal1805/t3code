@@ -91,14 +91,17 @@ export const ensureAntigravityHooks = Effect.fn("ensureAntigravityHooks")(functi
     }
     if (merged._tag === "Unchanged") return true;
     yield* fs.makeDirectory(path.dirname(target), { recursive: true });
-    const temporary = yield* fs.makeTempFile({
-      directory: path.dirname(target),
-      prefix: ".hooks-",
-      suffix: ".tmp",
-    });
-    yield* fs.writeFileString(temporary, merged.text).pipe(
-      Effect.andThen(fs.rename(temporary, target)),
-      Effect.onError(() => fs.remove(temporary, { force: true }).pipe(Effect.ignore)),
+    // The scratch directory goes with the scope on every path, so no temp entry outlives this.
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const scratch = yield* fs.makeTempDirectoryScoped({
+          directory: path.dirname(target),
+          prefix: ".hooks-",
+        });
+        const temporary = path.join(scratch, "hooks.json");
+        yield* fs.writeFileString(temporary, merged.text);
+        yield* fs.rename(temporary, target);
+      }),
     );
     return true;
   });

@@ -756,6 +756,16 @@ describe("AntigravityAdapterV2 background work", () => {
           [];
         const instanceId = ProviderInstanceId.make("antigravity-background-test");
         const threadId = ThreadId.make("thread-antigravity-background");
+        // The follower reads the transcript only once agy's Stop hook says the wake ended.
+        const transcriptRead = yield* Deferred.make<void>();
+        const watchedFileSystem: FileSystem.FileSystem = {
+          ...fileSystem,
+          stat: (target) =>
+            (target === transcriptPath
+              ? Deferred.succeed(transcriptRead, undefined)
+              : Effect.void
+            ).pipe(Effect.andThen(fileSystem.stat(target))),
+        };
         const adapter = yield* makeAntigravityAdapterV2({
           instanceId,
           selfInvocation: yield* resolveSelfInvocation(),
@@ -809,7 +819,7 @@ describe("AntigravityAdapterV2 background work", () => {
           },
           withProcess: (_stop, task) => task,
           defaultModel: Effect.undefined,
-        });
+        }).pipe(Effect.provideService(FileSystem.FileSystem, watchedFileSystem));
         const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
           runtimeMode: "full-access",
           interactionMode: "default",
@@ -898,19 +908,24 @@ describe("AntigravityAdapterV2 background work", () => {
         assert.isTrue(yield* session.hasPendingBackgroundWork!);
         assert.isDefined(eventsFile);
 
-        yield* fileSystem.writeFileString(
-          transcriptPath,
-          jsonl([
-            { step_index: 4, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
-            {
-              step_index: 5,
-              type: "SYSTEM_MESSAGE",
-              status: "DONE",
-              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=t sender=${SESSION}/task-2 priority=HIGH content=Task id "${SESSION}/task-2" finished with result:\nCommand exited with code 0.\n\nCommand output:\nONE\r\n\nLog: file:///x\n</SYSTEM_MESSAGE>`,
-            },
-            { step_index: 6, type: "PLANNER_RESPONSE", status: "DONE", content: "It printed ONE." },
-          ]),
-        );
+        // agy's model is still answering when the Stop hook lands: the transcript has the wake
+        // message but not yet the follow-up, as in the live run where the first run closed early.
+        const beforeAnswer = [
+          { step_index: 4, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
+          {
+            step_index: 5,
+            type: "SYSTEM_MESSAGE",
+            status: "DONE",
+            content: `<SYSTEM_MESSAGE>\n[Message] timestamp=t sender=${SESSION}/task-2 priority=HIGH content=Task id "${SESSION}/task-2" finished with result:\nCommand exited with code 0.\n\nCommand output:\nONE\r\n\nLog: file:///x\n</SYSTEM_MESSAGE>`,
+          },
+        ];
+        const answer = {
+          step_index: 6,
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "It printed ONE.",
+        };
+        yield* fileSystem.writeFileString(transcriptPath, jsonl(beforeAnswer));
         const common = { transcriptPath };
         yield* fileSystem.writeFileString(
           eventsFile!,
@@ -924,6 +939,10 @@ describe("AntigravityAdapterV2 background work", () => {
             hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 5 }) +
             hookLine("Stop", { ...common, fullyIdle: true }),
         );
+        yield* Deferred.await(transcriptRead);
+        // The card is held with its follow-up, so no run starts before the model has answered.
+        assert.lengthOf(continuationRequests, 0);
+        yield* fileSystem.writeFileString(transcriptPath, jsonl([...beforeAnswer, answer]));
         yield* Deferred.await(offered);
 
         yield* startTurn(2, {

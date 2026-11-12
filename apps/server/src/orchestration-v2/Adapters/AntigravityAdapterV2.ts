@@ -329,6 +329,8 @@ function followSubagentWake(
 /** The transcript can trail the Stop hook by a moment; a few re-reads, never a loop that runs on. */
 const TRANSCRIPT_RETRY_DELAY = "500 millis";
 const TRANSCRIPT_MAX_READS = 6;
+/** A finished task's card waits for its wake's follow-up so one run carries both; a missing Stop must not hold it forever. */
+const WAKE_HOLD_CAP = "90 seconds";
 
 /**
  * agy reports nothing when a background command or timer ends, or for the follow-up it then runs.
@@ -368,6 +370,7 @@ function followBackgroundWork(
       if (!result.incomplete) return;
       yield* Effect.sleep(TRANSCRIPT_RETRY_DELAY);
     }
+    yield* send(follower.flush());
   });
 
   const onHook = Effect.fn("AntigravityAdapterV2.followBackgroundHook")(function* (
@@ -375,6 +378,12 @@ function followBackgroundWork(
   ) {
     const step = follower.hook(event);
     yield* send(step.updates);
+    if (follower.holding()) {
+      yield* Effect.sleep(WAKE_HOLD_CAP).pipe(
+        Effect.andThen(Effect.suspend(() => send(follower.flush()))),
+        Effect.forkIn(scope),
+      );
+    }
     if (step.read !== undefined) yield* followTranscript(step.read.transcriptPath);
   });
 
@@ -400,6 +409,10 @@ function followBackgroundWork(
         deliver = handler;
         if (!tailing) {
           tailing = true;
+          yield* Scope.addFinalizer(
+            scope,
+            Effect.suspend(() => send(follower.lost())),
+          );
           yield* tailAntigravityHookEvents(eventsFile).pipe(
             Stream.runForEach(onHook),
             Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -430,9 +443,15 @@ function followBackgroundWork(
     prompt: (payload, options) =>
       Effect.sync(() => follower.promptStarted()).pipe(
         Effect.andThen(runtime.prompt(payload, options)),
+        Effect.tap((result) =>
+          result.stopReason === "end_turn"
+            ? Effect.void
+            : send(follower.failUnconfirmed("The command was interrupted.")),
+        ),
+        Effect.tapError(() => send(follower.failUnconfirmed("The turn failed."))),
         Effect.ensuring(Effect.sync(() => follower.promptReturned())),
       ),
-    cancel: Effect.sync(() => follower.abandon()).pipe(Effect.andThen(runtime.cancel)),
+    cancel: Effect.suspend(() => send(follower.abandon())).pipe(Effect.andThen(runtime.cancel)),
   };
 }
 
