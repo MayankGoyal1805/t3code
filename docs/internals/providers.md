@@ -36,18 +36,12 @@ Forks use Pi's CLI in the destination directory because RPC session switching re
 session's cwd. Provider switches still use portable handoff summaries.
 See the [adapter](../../packages/provider-pi/src/server/adapter.ts).
 
-Antigravity separates account profiles per instance while sharing installed executables across the
-environment. It forces file-based credential storage because the native macOS keychain entry would
-otherwise be shared across instances. The launch environment removes ambient Google credentials,
-so an instance cannot silently use another account or billing project. The agent also resolves
-its user-global skill directories under that profile, so the profile links those two directories
-back to the user's real `~/.gemini`; MCP servers, hooks, and rules there stay out of the profile.
-See [profile isolation](../../apps/server/src/provider/antigravityAuthSupport.ts).
-
-The [Antigravity installer](../../apps/server/src/provider/AntigravityInstallation.ts) outlives
-client connections and provider-instance rebuilds. Releases are immutable, with an atomic pointer
-selecting the version for new processes. Running processes hold leases on their version. Updates
-and removal must respect those leases instead of replacing executables under a running agent.
+Antigravity is a user-installed CLI (`agy acp`), like Claude; T3 Code never installs it. The
+default instance shares the user's `~/.gemini` with the CLI. Extra instances isolate credentials and
+conversations with a `--gemini-dir` argument relative to `$HOME`: `agy` ignores `GEMINI_HOME` and
+rejects absolute paths, and overriding `HOME` would also change the tools the agent runs. A
+configured directory outside `$HOME` is a setup error. See
+[Gemini directory resolution](../../apps/server/src/provider/Drivers/AntigravityHome.ts).
 
 ## Setup must not happen as a health-check side effect
 
@@ -59,7 +53,7 @@ explicit setup or model refresh; background checks use initialization only.
 [Antigravity sign-in](../../apps/server/src/provider/AntigravityAuth.ts) belongs to the initiating
 T3 auth session. The client carries the return URL back to the environment because the provider's
 loopback listener may be on another machine. Forward only the callback for the owned pending flow;
-a successful callback HTTP request is not proof that provider authentication finished. The native
+a successful callback HTTP request is not proof that provider authentication finished. The `agy`
 process owns token exchange and storage.
 
 Managed ChatGPT sign-in for a remote environment can finish on a local primary. The
@@ -70,7 +64,7 @@ that session; retaining a primary refresh session would race refresh-token rotat
 primary, the client uses the remote callback completion flow.
 
 Antigravity sign-out closes admission to new processes and stops existing processes before clearing account
-metadata. Otherwise a helper or resumed session could retain the old account. Cached model lists
+metadata; on the default instance it also signs out the shared CLI. Otherwise a helper or resumed session could retain the old account. Cached model lists
 do not establish current access, and an authoritative empty catalog must clear the old list.
 
 Antigravity text-generation helpers deny tool requests, but native hooks and MCP configuration can
@@ -137,9 +131,14 @@ start no Codex turn settle on a provider turn without a native ref, which native
 not count. Claude's SDK mode emits no goal events; its adapter reads goal state from the
 synthetic command output and Stop hook feedback in the transcript.
 
-Capabilities must describe what the provider can actually do. Antigravity can capture workspace
-checkpoints but cannot roll back its conversation. The [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
-therefore rejects revert before touching files. Native permission and question option IDs must
+Capabilities must describe what the provider can actually do. Antigravity has no rewind protocol, so
+[conversation rollback](../../apps/server/src/provider/acp/AntigravityRollback.ts) edits a copy of
+`agy`'s private conversation database and reloads it. That storage is undocumented, so rollback is
+gated to tested `agy` versions; elsewhere revert restores files and the next turn starts a fresh
+session. The subagent and turn-outcome readers decode the same private SQLite and protobuf data and
+are equally version-sensitive; they must degrade to no data, not fail the turn. The
+[checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
+rejects revert before touching files when a provider reports no rollback support. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.
 
 ## Attachments and stored history

@@ -1,18 +1,21 @@
 import {
+  AntigravitySettings,
   isProviderNativeSubagentThread,
   OrchestrationV2GetNativeChildWorkError,
   type OrchestrationV2GetNativeChildWorkInput,
   type OrchestrationV2GetNativeChildWorkResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
-import * as ServerConfig from "../config.ts";
 import { readAntigravityChildWork } from "../provider/acp/AntigravityChildWork.ts";
-import { resolveAntigravityInstanceDirectories } from "../provider/antigravityAuthSupport.ts";
+import { resolveAntigravityGeminiDirectory } from "../provider/Drivers/AntigravityHome.ts";
+import { deriveProviderInstanceConfigMap } from "../provider/ProviderInstanceRegistryHydration.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 /** Reads what a provider-native subagent's children did, on demand. Other providers stream real child sessions. */
@@ -28,12 +31,12 @@ export class NativeChildWorkQuery extends Context.Service<
   }
 >()("t3/orchestration-v2/NativeChildWorkQuery") {}
 
+const decodeAntigravitySettings = Schema.decodeUnknownOption(AntigravitySettings);
 const NO_CHILDREN: OrchestrationV2GetNativeChildWorkResult = { children: [] };
 
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
-  const { stateDir } = yield* ServerConfig.ServerConfig;
-  const digest = yield* Digest.Digest;
+  const settings = yield* ServerSettings.ServerSettingsService;
   const path = yield* Path.Path;
 
   const getNativeChildWork = Effect.fn("NativeChildWorkQuery.getNativeChildWork")(
@@ -61,43 +64,27 @@ const make = Effect.gen(function* () {
       ) {
         return NO_CHILDREN;
       }
-      const others = subagents.filter(
-        (candidate) =>
-          candidate.id !== subagent.id &&
-          candidate.driver === "antigravity" &&
-          candidate.origin === "provider_native" &&
-          candidate.providerInstanceId === subagent.providerInstanceId,
-      );
       const { runs, providerThreads } = yield* threads.getThreadRecords(
         parentThreadId,
         ["runs", "providerThreads"],
-        { runIds: [subagent.runId, ...others.flatMap((other) => other.runId ?? [])] },
+        { runIds: [subagent.runId] },
       );
-      const providerThreadOf = (runId: string | null) => {
-        const providerThreadId = runs.find((run) => run.id === runId)?.providerThreadId;
-        return providerThreads.find((candidate) => candidate.id === providerThreadId);
-      };
-      const providerThread = providerThreadOf(subagent.runId);
+      const providerThreadId = runs.find((run) => run.id === subagent.runId)?.providerThreadId;
+      const providerThread = providerThreads.find((candidate) => candidate.id === providerThreadId);
       const rootSessionId = providerThread?.nativeThreadRef?.nativeId;
       if (!rootSessionId || providerThread?.providerInstanceId !== subagent.providerInstanceId) {
         return NO_CHILDREN;
       }
-      const directories = yield* resolveAntigravityInstanceDirectories(
-        stateDir,
-        subagent.providerInstanceId,
-      ).pipe(Effect.provideService(Digest.Digest, digest), Effect.provideService(Path.Path, path));
+      const config = deriveProviderInstanceConfigMap(yield* settings.getSettings)[
+        subagent.providerInstanceId
+      ]?.config;
+      const geminiDirectory = yield* resolveAntigravityGeminiDirectory(
+        Option.getOrElse(decodeAntigravitySettings(config ?? {}), () => ({ homePath: "" })),
+      ).pipe(Effect.provideService(Path.Path, path));
       const children = yield* readAntigravityChildWork({
-        profileDirectory: directories.profile,
+        profileDirectory: geminiDirectory,
         rootSessionId,
         nativeTaskId,
-        launch: { title: subagent.title, prompt: subagent.prompt },
-        // Only batches from the same agent session can share its records.
-        siblings: others.flatMap((other) => {
-          const id = other.nativeTaskRef?.nativeId;
-          return id && providerThreadOf(other.runId)?.nativeThreadRef?.nativeId === rootSessionId
-            ? [{ nativeTaskId: id, title: other.title, prompt: other.prompt }]
-            : [];
-        }),
       });
       return { children };
     },

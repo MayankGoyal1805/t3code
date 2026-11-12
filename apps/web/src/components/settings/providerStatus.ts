@@ -105,11 +105,6 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
 
 export function getProviderVersionLabel(version: string | null | undefined) {
   if (!version) return null;
-  const antigravity = /^agy_acp_server_(\d{4})(\d{2})(\d{2})_\d+(?:_(\w+))?$/.exec(version);
-  if (antigravity) {
-    const [, year, month, day, candidate] = antigravity;
-    return `${year}-${month}-${day}${candidate ? ` ${candidate}` : ""}`;
-  }
   return /^\d/.test(version) ? `v${version}` : version;
 }
 

@@ -60,10 +60,9 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     summaryStatus?: number;
     /** Per-host summary statuses; hosts not listed fall back to `summaryStatus`. */
     summaryStatusByHost?: Record<string, number>;
-    tokenStatus?: number;
-    refreshToken?: string;
-    userId?: string;
-    userInfoAt?: number;
+    /** null leaves the email out of the token. */
+    email?: string | null;
+    expiry?: string;
     missingToken?: boolean;
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
   } = {},
@@ -71,19 +70,19 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const profileDirectory = yield* fs.makeTempDirectoryScoped();
-  yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"));
-  const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
-  const writeToken = (refreshToken: string) =>
+  yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-cli"));
+  const tokenPath = path.join(profileDirectory, "antigravity-cli", "antigravity-oauth-token");
+  const writeToken = (email: string | null, expiry = options.expiry ?? "2099-01-01T00:00:00Z") =>
     fs.writeFileString(
       tokenPath,
       JSON.stringify({
-        client_id: "client-id",
-        client_secret: "client-secret",
-        refresh_token: refreshToken,
-        project_id: "project-id",
+        token: { access_token: "access-token", token_type: "Bearer", expiry },
+        auth_method: "oauth-personal",
+        ...(email === null ? {} : { id_token_email: email }),
       }),
     );
-  if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
+  if (!options.missingToken)
+    yield* writeToken(options.email === undefined ? "someone@example.com" : options.email);
   const requests: Array<{ url: string; body: string }> = [];
   const http = HttpClient.make((request, url, _signal, fiber) =>
     Effect.sync(() => {
@@ -92,26 +91,8 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       const body =
         request.body._tag === "Uint8Array" ? new TextDecoder().decode(request.body.body) : "";
       requests.push({ url: request.url, body });
-      if (request.url.endsWith("/token")) {
-        expect(new URLSearchParams(body).get("grant_type")).toBe("refresh_token");
-        return HttpClientResponse.fromWeb(
-          request,
-          Response.json(
-            { access_token: "access-token", expires_in: 3600 },
-            { status: options.tokenStatus ?? 200 },
-          ),
-        );
-      }
       expect(request.headers.authorization).toBe("Bearer access-token");
-      if (request.url.endsWith("/userinfo")) {
-        return HttpClientResponse.fromWeb(
-          request,
-          options.userId
-            ? Response.json({ id: options.userId, email: "someone@example.com" })
-            : Response.json({}, { status: 403 }),
-        );
-      }
-      expect(JSON.parse(body)).toEqual({ project: "project-id" });
+      expect(JSON.parse(body)).toEqual({});
       expect(request.headers["user-agent"]).toMatch(/^antigravity\/hub\/2\.24\.0 /);
       return HttpClientResponse.fromWeb(
         request,
@@ -121,19 +102,13 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
             })
           : Response.json(options.models ?? { models: {} }),
       );
-    }).pipe(
-      Effect.tap(() =>
-        request.url.endsWith("/userinfo") && options.userInfoAt !== undefined
-          ? TestClock.setTime(options.userInfoAt)
-          : Effect.void,
-      ),
-    ),
+    }),
   );
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
-  return { ...usage, requests, writeToken, tokenPath };
+  return { ...usage, requests, tokenPath };
 });
 
 describe("Antigravity subscription limits", () => {
@@ -200,12 +175,11 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  // Oracle: measure the tolerance from the summary request, after auth.
-  it.effect("uses summary request time after authentication for the reset tolerance", () =>
+  // Oracle: measure the tolerance from the summary request time.
+  it.effect("uses the summary request time for the reset tolerance", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:02Z")));
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
       const { probe } = yield* fixture({
-        userInfoAt: DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")),
         summary: {
           buckets: [
             {
@@ -439,7 +413,6 @@ describe("Antigravity subscription limits", () => {
       expect(byId.get("3p-5h")).toMatchObject({ kind: "session", windowDurationMins: 300 });
       expect(byId.get("3p-5h")?.usedPercent).toBeCloseTo(56);
       yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1);
       expect(
         requests.filter((request) => request.url.endsWith(":retrieveUserQuotaSummary")),
       ).toHaveLength(4);
@@ -559,36 +532,25 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  it.effect("re-reads changed credentials and clears cached access after sign-out", () =>
-    Effect.gen(function* () {
-      const { probe, clear, requests, writeToken, tokenPath } = yield* fixture();
-      const first = yield* probe;
-      yield* writeToken("refresh-b");
-      const second = yield* probe;
-      expect(second.credentialFingerprint).not.toBe(first.credentialFingerprint);
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(2);
-      yield* (yield* FileSystem.FileSystem).remove(tokenPath);
-      expect((yield* probe).unavailable?.reason).toBe("unsupported");
-      yield* writeToken("refresh-b");
-      yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(3);
-      yield* clear;
-      yield* probe;
-      expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(4);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
   it.effect("names one Google account the same way from every sign-in", () =>
     Effect.gen(function* () {
-      const read = (refreshToken: string, userId: string) =>
-        fixture({ refreshToken, userId }).pipe(Effect.flatMap((usage) => usage.probe));
-      const machineA = yield* read("refresh-a", "google-user-1");
-      const machineB = yield* read("refresh-b", "google-user-1");
-      const otherAccount = yield* read("refresh-c", "google-user-2");
+      const read = (email: string) =>
+        fixture({ email }).pipe(Effect.flatMap((usage) => usage.probe));
+      const machineA = yield* read("someone@example.com");
+      const machineB = yield* read("someone@example.com");
+      const otherAccount = yield* read("other@example.com");
       expect(machineA.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
       expect(machineB.credentialFingerprint).toBe(machineA.credentialFingerprint);
       expect(otherAccount.credentialFingerprint).not.toBe(machineA.credentialFingerprint);
-      expect(JSON.stringify(machineA)).not.toMatch(/google-user-1|someone@example.com/);
+      expect(JSON.stringify(machineA)).not.toMatch(/someone@example.com|access-token/);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("does not name an account whose email is unknown", () =>
+    Effect.gen(function* () {
+      const limits = yield* fixture({ email: null }).pipe(Effect.flatMap((usage) => usage.probe));
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.credentialFingerprint).toBeUndefined();
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
@@ -644,13 +606,15 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
-  it.effect("returns a safe failure when OAuth refresh fails", () =>
+  it.effect("asks for a session instead of using an expired access token", () =>
     Effect.gen(function* () {
-      const { probe } = yield* fixture({ tokenStatus: 401 });
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-21T10:16:04Z")));
+      const { probe, requests } = yield* fixture({ expiry: "2026-10-21T10:16:30Z" });
       const limits = yield* probe;
       expect(limits.windows).toEqual([]);
       expect(limits.unavailable?.reason).toBe("probeFailed");
-      expect(JSON.stringify(limits)).not.toMatch(/client-secret|refresh-a|access-token/);
+      expect(limits.unavailable?.message).toContain("Start an Antigravity session");
+      expect(requests).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 

@@ -1,6 +1,5 @@
-import { type AntigravitySettings, UsageReadError } from "@t3tools/contracts";
+import { type AntigravitySettings, type UsageReadError } from "@t3tools/contracts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
-import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import type {
   ProviderUsageInstance,
   ProviderUsageReader,
@@ -8,13 +7,12 @@ import type {
 } from "@t3tools/provider-core/server/usage";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
-import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 
-import { resolveAntigravityInstanceDirectories } from "../antigravityAuthSupport.ts";
+import { resolveAntigravityGeminiDirectory } from "./AntigravityHome.ts";
 import { makeAntigravityUsageCache, readAntigravityUsage } from "./antigravityUsageReader.ts";
 
 export class AntigravityUsage extends Context.Service<
@@ -28,10 +26,8 @@ export class AntigravityUsage extends Context.Service<
 >()("t3/provider/Drivers/AntigravityUsage") {}
 
 const make = Effect.gen(function* () {
-  const digest = yield* Digest.Digest;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const host = yield* ProviderHost.ProviderHost;
   const cache = makeAntigravityUsageCache();
 
   const dataRoots = Effect.fn("AntigravityUsage.dataRoots")(function* (
@@ -64,23 +60,17 @@ const make = Effect.gen(function* () {
   }) {
     const roots: Array<string> = [];
     for (const instance of instances) roots.push(...(yield* dataRoots(instance.environment)));
-    for (const { instanceId } of instances.filter((instance) => instance.configured)) {
-      const directories = yield* resolveAntigravityInstanceDirectories(
-        host.paths.stateDir,
-        instanceId,
-      ).pipe(
-        Effect.provideService(Digest.Digest, digest),
-        Effect.provideService(Path.Path, path),
-        Effect.mapError(
-          (cause) =>
-            new UsageReadError({
-              reason: "scanFailed",
-              detail: "Antigravity profile directory could not be resolved.",
-              cause,
-            }),
-        ),
-      );
-      roots.push(path.join(directories.profile, "antigravity-acp"));
+    for (const instance of instances) {
+      if (instance.configured && instance.config !== undefined && instance.config.homePath) {
+        roots.push(
+          path.join(
+            yield* resolveAntigravityGeminiDirectory(instance.config).pipe(
+              Effect.provideService(Path.Path, path),
+            ),
+            "antigravity-cli",
+          ),
+        );
+      }
     }
     const conversationDirs = new Set<string>();
     for (const root of roots) {

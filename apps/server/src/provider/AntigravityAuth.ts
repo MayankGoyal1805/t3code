@@ -31,9 +31,8 @@ import {
 import type { ProviderAuthController } from "./ProviderAuthService.ts";
 
 const AUTH_TIMEOUT_MS = 300_000;
-// Once initialized, a healthy agent shows the Google link within seconds; its bundled Python has no
-// IPv4 fallback, so broken IPv6 stalls each Google request. Startup is timed separately: the
-// one-file runtime unpacks on every launch (about a minute on Windows) before it answers initialize.
+// Once initialized, a healthy agent shows the Google link within seconds. Startup is timed
+// separately, so a runtime that never answers initialize is not blamed on the network.
 const NO_RESPONSE_HINT_MS = 30_000;
 const STARTUP_HINT_MS = 90_000;
 const NOT_STARTED_MESSAGE =
@@ -255,13 +254,8 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
         lock.withPermits(1)(
           Effect.gen(function* () {
             if (activeFlow !== flow || operation !== "auth") return;
-            if (flow.pending) {
-              if (flow.pending.authorizationUrl === authorization.authorizationUrl) return;
-              return yield* new AcpErrors.AcpTransportError({
-                detail: "Antigravity started more than one Google sign-in request.",
-                cause: undefined,
-              });
-            }
+            if (flow.pending?.authorizationUrl === authorization.authorizationUrl) return;
+            // agy relaunches its browser when it retries; the newest request supersedes the last.
             flow.pending = authorization;
             yield* publishFlow(flow, {
               ...flow.state,

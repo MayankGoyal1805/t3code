@@ -10,9 +10,12 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Clock from "effect/Clock";
 import * as Exit from "effect/Exit";
-import * as Semaphore from "effect/Semaphore";
+import * as Fiber from "effect/Fiber";
+import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
+import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -32,18 +35,25 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
-import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "../../provider/acp/AntigravityChildWork.ts";
+import { rollbackAntigravityConversationOffThread } from "../../provider/acp/AntigravityRollback.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
+import {
+  makeAntigravityWakeTracker,
+  readAntigravityWakeSteps,
+  type AntigravityWakeOutput,
+} from "../../provider/acp/AntigravityWake.ts";
 import {
   antigravityApprovalOptions,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
-  makeAntigravityReadRepair,
+  isAntigravitySubagentTitle,
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
 } from "../../provider/acp/AntigravityProtocol.ts";
 import { isAntigravitySignInRequiredError } from "../../provider/antigravityAuthSupport.ts";
+import { antigravityConversationExists } from "../../provider/Drivers/AntigravityHome.ts";
 import {
   AcpProviderCapabilitiesV2,
   makeAcpAdapterV2,
@@ -52,6 +62,13 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
+
+const TERMINAL_TURN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "interrupted",
+  "failed",
+  "cancelled",
+]);
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -89,13 +106,18 @@ export interface AntigravityAdapterV2Options {
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
-  /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
+  /** The running agy version; rollback edits agy's private storage only for versions it was verified against. */
+  readonly version?: Effect.Effect<string | undefined>;
+  /** The Gemini directory that holds agy's `antigravity-cli` data. Its conversations show turns that ended on an upstream error. */
   readonly profileDirectory?: string;
 }
 
+/** Marks the update that carries a subagent's report: agy streams none, so the session log supplies it. */
+const ANTIGRAVITY_SUBAGENT_REPORT_META = "t3SubagentReport";
+
 /**
  * Native subagent tools report no child session ids, so children stay read-only.
- * Only permission prompts carry the launch; NativeChildWorkQuery matches their ids by this text.
+ * The tool call's `rawInput` carries the launch; NativeChildWorkQuery matches child ids by its text.
  */
 const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractSubagentUpdate"]> = (
   toolCall,
@@ -103,8 +125,20 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
   if (classifyAntigravitySubagentToolCall(toolCall) !== "subagent") {
     return undefined;
   }
+  // agy reports a launch as completed at once; only the wake follow-up carries the child's report.
+  const meta = toolCall.data.meta;
+  const report =
+    Predicate.isObject(meta) && typeof meta[ANTIGRAVITY_SUBAGENT_REPORT_META] === "string"
+      ? meta[ANTIGRAVITY_SUBAGENT_REPORT_META]
+      : undefined;
   const status =
-    toolCall.status === "failed" ? "failed" : toolCall.status === "pending" ? "pending" : "running";
+    toolCall.status === "failed"
+      ? "failed"
+      : toolCall.status === "pending"
+        ? "pending"
+        : report !== undefined
+          ? "completed"
+          : "running";
   const launches = antigravitySubagentLaunches(toolCall.data.rawInput);
   const launch = launches === undefined ? undefined : describeAntigravitySubagentLaunches(launches);
   return {
@@ -116,10 +150,15 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     title: launch?.title ?? ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-    model: null,
+    model: launch?.model ?? null,
     status,
     childSessionId: null,
-    result: status === "failed" ? (antigravitySubagentOutput(toolCall) ?? null) : null,
+    result:
+      status === "failed"
+        ? (antigravitySubagentOutput(toolCall) ?? null)
+        : status === "completed"
+          ? (report ?? null)
+          : null,
   };
 };
 
@@ -130,12 +169,169 @@ interface AntigravityFlavorServices {
   readonly host: ProviderHost.ProviderHost["Service"];
 }
 
+type AntigravityRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"];
+
+const WAKE_POLL_INTERVAL = "1 second";
+const WAKE_MAX_AGE_MILLIS = 30 * 60 * 1000;
+
+const wakeExpiredNotification = (
+  sessionId: string,
+  toolCallId: string,
+  launchInput: unknown,
+): EffectAcpSchema.SessionNotification => ({
+  sessionId,
+  update: {
+    sessionUpdate: "tool_call_update",
+    toolCallId,
+    title: "Run invoke_subagent",
+    kind: "other",
+    status: "failed",
+    rawInput: launchInput,
+    rawOutput: "The subagent did not report back.",
+  },
+});
+
+const wakeNotification = (
+  sessionId: string,
+  output: AntigravityWakeOutput,
+  launchInput: unknown,
+): EffectAcpSchema.SessionNotification => ({
+  sessionId,
+  update:
+    output.type === "text"
+      ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text: output.text } }
+      : {
+          sessionUpdate: "tool_call_update",
+          toolCallId: output.toolCallId,
+          title: "Run invoke_subagent",
+          kind: "other",
+          status: "completed",
+          rawInput: launchInput,
+          _meta: { [ANTIGRAVITY_SUBAGENT_REPORT_META]: output.result },
+        },
+});
+
+/**
+ * agy streams nothing when a subagent reports back; its session log holds the follow-up, which is
+ * read while a launch is outstanding. Following ends with the turn (new prompt, cancel), a failed
+ * launch, or the age cap, so a late wake never reaches another turn.
+ */
+function followSubagentWake(
+  runtime: AntigravityRuntime,
+  scope: Scope.Scope,
+  profileDirectory: string,
+): AntigravityRuntime {
+  const tracker = makeAntigravityWakeTracker();
+  const launchInputs = new Map<string, unknown>();
+  let deliver: Parameters<AntigravityRuntime["handleSessionUpdate"]>[0] | undefined;
+  let following: Fiber.Fiber<void> | undefined;
+
+  const send = (notification: EffectAcpSchema.SessionNotification) =>
+    (deliver?.(notification) ?? Effect.void).pipe(Effect.ignore);
+
+  const endTurn = Effect.suspend(() => {
+    const fiber = following;
+    following = undefined;
+    tracker.reset();
+    launchInputs.clear();
+    return fiber === undefined ? Effect.void : Fiber.interrupt(fiber);
+  });
+
+  const follow = Effect.fn("AntigravityAdapterV2.followSubagentWake")(function* (
+    sessionId: string,
+  ) {
+    const startedAt = yield* Clock.currentTimeMillis;
+    while (tracker.pending()) {
+      const steps = yield* readAntigravityWakeSteps(profileDirectory, sessionId, tracker.cursor());
+      for (const output of tracker.advance(steps)) {
+        const launchInput =
+          output.type === "completed" ? launchInputs.get(output.toolCallId) : null;
+        yield* send(wakeNotification(sessionId, output, launchInput));
+      }
+      if (!tracker.pending()) break;
+      if ((yield* Clock.currentTimeMillis) - startedAt >= WAKE_MAX_AGE_MILLIS) {
+        for (const toolCallId of tracker.pendingIds()) {
+          tracker.drop(toolCallId);
+          yield* send(wakeExpiredNotification(sessionId, toolCallId, launchInputs.get(toolCallId)));
+        }
+        break;
+      }
+      yield* Effect.sleep(WAKE_POLL_INTERVAL);
+    }
+  });
+
+  const observe = Effect.fnUntraced(function* (notification: EffectAcpSchema.SessionNotification) {
+    const { update } = notification;
+    if (update.sessionUpdate === "agent_message_chunk") {
+      if (update.content.type === "text" && tracker.pending()) {
+        tracker.observeLiveText(update.content.text);
+      }
+      return;
+    }
+    if (
+      update.sessionUpdate === "tool_call_update" &&
+      update.status === "failed" &&
+      tracker.tracks(update.toolCallId)
+    ) {
+      tracker.drop(update.toolCallId);
+      launchInputs.delete(update.toolCallId);
+      return;
+    }
+    // A replayed history carries finished launches; only a live launch has a wake to follow.
+    if (
+      update.sessionUpdate !== "tool_call" ||
+      !isAntigravitySubagentTitle(update.title) ||
+      (update.status !== "in_progress" && update.status !== "pending")
+    ) {
+      return;
+    }
+    tracker.launch(update.toolCallId);
+    launchInputs.set(update.toolCallId, update.rawInput);
+    if (following !== undefined) return;
+    const fiber = yield* follow(notification.sessionId).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (following === fiber) following = undefined;
+        }),
+      ),
+      Effect.forkIn(scope),
+    );
+    following = fiber;
+  });
+
+  return {
+    ...runtime,
+    handleSessionUpdate: (handler) => {
+      deliver = handler;
+      return runtime.handleSessionUpdate((notification) =>
+        observe(notification).pipe(Effect.andThen(handler(notification))),
+      );
+    },
+    prompt: (payload, options) => endTurn.pipe(Effect.andThen(runtime.prompt(payload, options))),
+    cancel: endTurn.pipe(Effect.andThen(runtime.cancel)),
+  };
+}
+
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
-  const antigravityClientFileRoots = (cwd: string | null) =>
-    cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
+  const missingConversation = (sessionId: string) =>
+    new EffectAcpErrors.AcpRequestError({
+      code: -32002,
+      method: "session/load",
+      errorMessage: `Antigravity has no conversation ${sessionId}. It was created by an older T3 Code runtime or deleted from agy's history.`,
+    });
+  const requireConversation = (sessionId: string) =>
+    profileDirectory === undefined
+      ? Effect.void
+      : antigravityConversationExists(profileDirectory, sessionId).pipe(
+          Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+          Effect.provideService(Path.Path, options.path),
+          // agy answers `session/load` for an unknown id with an empty session.
+          Effect.filterOrFail(Boolean, () => missingConversation(sessionId)),
+          Effect.asVoid,
+        );
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       const scope = yield* Scope.fork(yield* Effect.scope);
@@ -144,56 +340,33 @@ export function makeAntigravityAcpAdapterFlavor(
           Scope.close(scope, Exit.void),
           options.makeRuntime({
             ...input,
-            clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
             additionalDirectories: [options.host.paths.attachmentsDir],
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
-      // Repair keeps state across updates, so each runtime must have one session-update handler.
-      const reads = makeAntigravityReadRepair();
-      // Served reads are reported from the read handler, so they take turns with agent updates.
-      const updates = yield* Semaphore.make(1);
-      let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
+      const followed =
+        profileDirectory === undefined
+          ? runtime
+          : followSubagentWake(runtime, scope, profileDirectory);
       return {
-        ...runtime,
-        handleReadTextFile: (handler) =>
-          runtime.handleReadTextFile((request, context) =>
-            handler(request, context).pipe(
-              Effect.onExit((exit) => {
-                const served = reads.attempted(request.path, Exit.isSuccess(exit));
-                if (served === undefined || projectUpdate === undefined) return Effect.void;
-                return updates
-                  .withPermit(
-                    projectUpdate({
-                      sessionId: served.sessionId,
-                      update: {
-                        sessionUpdate: "tool_call_update",
-                        toolCallId: served.toolCallId,
-                        status: "completed",
-                      },
-                    }),
-                  )
-                  .pipe(Effect.ignore);
-              }),
-            ),
+        ...followed,
+        loadSession: (sessionId, activation) =>
+          requireConversation(sessionId).pipe(
+            Effect.andThen(runtime.loadSession(sessionId, activation)),
           ),
-        prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
-        handleSessionUpdate: (handler) => {
-          projectUpdate = handler;
-          return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
-          );
-        },
+        resumeSession: (sessionId, activation) =>
+          requireConversation(sessionId).pipe(
+            Effect.andThen(runtime.resumeSession(sessionId, activation)),
+          ),
         start: () =>
-          runtime
-            .start()
-            .pipe(
-              Effect.tap(
-                (started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void,
-              ),
-            ),
+          (input.resumeSessionId === undefined
+            ? Effect.void
+            : requireConversation(input.resumeSessionId)
+          ).pipe(
+            Effect.andThen(runtime.start()),
+            Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
+          ),
       } satisfies typeof runtime;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),
@@ -204,6 +377,23 @@ export function makeAntigravityAcpAdapterFlavor(
     ),
   );
 
+  // Rolled-back state is a truncated copy of the native conversation, loaded under a new id.
+  const rollbackSession: AcpAdapterV2Flavor["rollbackSession"] = Effect.fn(
+    "AntigravityAdapterV2.rollbackSession",
+  )(function* ({ target, providerThreadTurns, nativeSessionId }) {
+    if (profileDirectory === undefined || target.type !== "provider_turn") return undefined;
+    const terminalTurns = providerThreadTurns.filter(
+      (turn) => turn.nativeTurnRef !== null && TERMINAL_TURN_STATUSES.has(turn.status),
+    );
+    return yield* rollbackAntigravityConversationOffThread(options.selfInvocation, {
+      conversationsDir: options.path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS),
+      sessionId: nativeSessionId,
+      keepTurns: terminalTurns.filter((turn) => turn.ordinal <= target.providerTurn.ordinal).length,
+      expectedTurns: terminalTurns.length,
+      version: options.version === undefined ? undefined : yield* options.version,
+    });
+  });
+
   return {
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
@@ -212,27 +402,20 @@ export function makeAntigravityAcpAdapterFlavor(
     mcpOverHttp: true,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
-    buildPrompt: ({
-      text,
-      attachments,
-      resolveAttachmentPath,
-      promptCapabilities,
-      agentVersion,
-      currentModel,
-    }) =>
+    rollbackSession,
+    buildPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
       buildAntigravityPrompt({
         input: text,
         attachments,
         resolveAttachmentPath,
         promptCapabilities,
-        agentVersion,
-        currentModel,
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, options.fileSystem),
         Effect.provideService(Path.Path, options.path),
       ),
-    // Loading history replays tool calls; resume avoids replay.
+    // Without the session log a launch's report never arrives, so its turn must not wait for one.
     subagentsIdleOnTurnCompletion: true,
+    deferFinalizeForBackgroundWork: profileDirectory !== undefined,
     ...(options.onSessionEvent === undefined ? {} : { onSessionEvent: options.onSessionEvent }),
     applyModelSelection: Effect.fn("AntigravityAdapterV2.applyModelSelection")(function* ({
       runtime,
@@ -249,15 +432,6 @@ export function makeAntigravityAcpAdapterFlavor(
     }),
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
-    clientFileSystem: {
-      readTextFile: (request, cwd) =>
-        readAntigravityClientTextFile({
-          fileSystem: options.fileSystem,
-          path: options.path,
-          allowedRoots: antigravityClientFileRoots(cwd),
-          request,
-        }),
-    },
     approvalOptions: antigravityApprovalOptions,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);
@@ -270,12 +444,10 @@ export function makeAntigravityAcpAdapterFlavor(
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     supportsImagePrompts: true,
-    // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,
     requiresSignIn: isAntigravitySignInRequiredError,
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
-    // 1.4.5 returns the root trajectory's Gemini usageMetadata delta; 1.4.1 returns none.
     reportsPerTurnPromptUsage: true,
     geminiPromptUsage: true,
     ...(profileDirectory === undefined

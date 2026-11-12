@@ -46,7 +46,7 @@ const initializeResult = {
   agentInfo: {
     name: "antigravity-acp",
     title: "Google Antigravity",
-    version: "agy_acp_server_20260818_01_RC01",
+    version: "1.5.1",
   },
 } satisfies EffectAcpSchema.InitializeResponse;
 
@@ -140,6 +140,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
   const initialProbe = yield* Deferred.make<EffectAcpSchema.InitializeResponse, ProbeError>();
   const probeCalls = yield* Ref.make(0);
   const safetyCalls = yield* Ref.make(0);
+  const authRequired = yield* Ref.make(false);
   const probe = yield* Ref.make<Effect.Effect<EffectAcpSchema.InitializeResponse, ProbeError>>(
     Deferred.await(initialProbe),
   );
@@ -153,6 +154,11 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
       probe: Ref.update(probeCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(probe)),
         Effect.flatten,
+        Effect.flatMap((initialize) =>
+          Ref.get(authRequired).pipe(
+            Effect.map((required) => ({ initialize, authRequired: required })),
+          ),
+        ),
       ),
       supportsTextGeneration: Ref.update(safetyCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(safety)),
@@ -178,6 +184,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     provider,
     probe,
     probeCalls,
+    authRequired,
     safety,
     safetyCalls,
     initialProbe,
@@ -301,7 +308,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           status: "disabled",
           auth: { status: "unknown" },
           models: [],
-          setup: { canAuthenticate: true, canInstall: true },
+          setup: { canAuthenticate: true, canInstall: false },
           showInteractionModeToggle: false,
           supportsConversationRollback: false,
           supportsTextGeneration: false,
@@ -334,7 +341,7 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           expect(snapshot).toMatchObject({
             installed: true,
             status: "warning",
-            version: "agy_acp_server_20260818_01_RC01",
+            version: "1.5.1",
             auth: { status: "unknown", ...(auth ? { type: auth.type } : {}) },
             message:
               auth?.type === "gemini-api-key" || auth?.type === "agent-platform"
@@ -346,6 +353,109 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         }
       }),
     ),
+  );
+
+  it.effect("labels an authenticated account with the plan agy reports", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        yield* harness.provider.onSessionStarted({
+          ...started,
+          sessionSetupResult: {
+            ...sessionSetupResult,
+            _meta: { antigravity: { tier: { name: "Google AI Pro", id: "g1-pro-tier" } } },
+          },
+        });
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          status: "ready",
+          auth: { status: "authenticated", type: "oauth-personal", label: "Google AI Pro" },
+        });
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).auth.label).toBe("Google account");
+      }),
+    ),
+  );
+
+  it.effect("reports a signed-out account from the probe and clears the catalog", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* Ref.set(harness.authRequired, true);
+        yield* harness.initialize;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          installed: true,
+          status: "warning",
+          version: "1.5.1",
+          auth: { status: "unauthenticated" },
+          message: "Sign in with Google to use Antigravity.",
+          models: [],
+          supportsTextGeneration: false,
+        });
+        yield* Ref.set(harness.authRequired, false);
+        yield* harness.provider.onSessionStarted(started);
+        expect((yield* harness.provider.snapshot.getSnapshot).models).not.toEqual([]);
+        yield* Ref.set(harness.authRequired, true);
+        yield* harness.provider.snapshot.refresh;
+        expect(yield* harness.provider.snapshot.getSnapshot).toMatchObject({
+          auth: { status: "unauthenticated" },
+          models: [],
+          supportsTextGeneration: false,
+        });
+      }),
+    ),
+  );
+
+  it.effect(
+    "keeps what a sign-in discovered when a probe that began before it reports signed out",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness();
+          yield* harness.initialize;
+          const thinking = (currentValue: string) =>
+            ({
+              id: "thinking_level",
+              name: "Thinking Level",
+              category: "thought_level",
+              type: "select",
+              currentValue,
+              options: [
+                { value: "low", name: "Low" },
+                { value: "high", name: "High" },
+              ],
+            }) satisfies EffectAcpSchema.SessionConfigOption;
+          yield* harness.provider.onSessionStarted(started);
+          yield* harness.provider.onConfigOptionsUpdated([
+            { ...modelConfig, currentValue: "gemini-3.7-flash-high" },
+            thinking("low"),
+          ]);
+          yield* Ref.set(harness.authRequired, true);
+          yield* Ref.set(
+            harness.probe,
+            harness.provider
+              .onSessionStarted({
+                ...started,
+                sessionSetupResult: {
+                  ...sessionSetupResult,
+                  configOptions: [{ ...modelConfig, currentValue: "gemini-pro-agent" }],
+                },
+              })
+              .pipe(Effect.as(initializeResult)),
+          );
+          yield* harness.provider.snapshot.refresh;
+          yield* harness.provider.onConfigOptionsUpdated([
+            { ...modelConfig, currentValue: "gemini-pro-agent" },
+            thinking("high"),
+          ]);
+          const snapshot = yield* harness.provider.snapshot.getSnapshot;
+          expect(snapshot.auth.status).toBe("authenticated");
+          expect(
+            snapshot.models.find((model) => model.slug === "gemini-3.7-flash-high")?.capabilities
+              ?.optionDescriptors?.[0],
+          ).toMatchObject({ currentValue: "low" });
+        }),
+      ),
   );
 
   it.effect("does not offer Auto, so Auto threads fall back to Supervised", () =>

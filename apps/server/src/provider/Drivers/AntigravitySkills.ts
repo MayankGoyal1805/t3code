@@ -7,30 +7,14 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { parse as parseYamlDocument } from "yaml";
 
-/** Match Python os.path.expanduser: USERPROFILE, then HOMEDRIVE+HOMEPATH on Windows; HOME elsewhere. */
-export function resolveAntigravityUserHome(
-  platform: NodeJS.Platform,
-  environment: NodeJS.ProcessEnv,
-  home: string,
-): string {
-  if (platform === "win32") {
-    if (environment.USERPROFILE) return environment.USERPROFILE;
-    if (environment.HOMEDRIVE && environment.HOMEPATH) {
-      return `${environment.HOMEDRIVE}${environment.HOMEPATH}`;
-    }
-    return home;
-  }
-  return environment.HOME || home;
-}
-
-/** Link private GEMINI_HOME skills to ~/.gemini; ~/.agents/skills is ignored because .agents/skills is project-only. */
-export function antigravityUserSkillDirectories(
+/** User skill roots under the Gemini directory; ~/.agents/skills is ignored because .agents/skills is project-only. */
+function antigravityUserSkillDirectories(
   path: Path.Path,
-  geminiHome: string,
+  geminiDirectory: string,
 ): readonly [configSkills: string, cliSkills: string] {
   return [
-    path.join(geminiHome, "config", "skills"),
-    path.join(geminiHome, "antigravity-cli", "skills"),
+    path.join(geminiDirectory, "config", "skills"),
+    path.join(geminiDirectory, "antigravity-cli", "skills"),
   ];
 }
 
@@ -140,7 +124,7 @@ const readSkill = Effect.fn("readAntigravitySkill")(function* (
 /** Keep read errors typed so workspace snapshots cannot cache partial results. */
 export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(function* (input: {
   readonly cwd: string;
-  readonly userHome: string;
+  readonly geminiDirectory: string;
 }): Effect.fn.Return<
   ReadonlyArray<ServerProviderSkill>,
   AntigravitySkillsProbeError,
@@ -148,10 +132,7 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
 > {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const [configSkills, cliSkills] = antigravityUserSkillDirectories(
-    path,
-    path.join(input.userHome, ".gemini"),
-  );
+  const [configSkills, cliSkills] = antigravityUserSkillDirectories(path, input.geminiDirectory);
   const roots = [
     { directory: configSkills, scope: "user" },
     { directory: path.resolve(input.cwd, ".gemini", "skills"), scope: "project" },

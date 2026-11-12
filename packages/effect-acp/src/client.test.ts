@@ -820,7 +820,7 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
       );
       const initialized = yield* Fiber.join(initializeFiber);
       assert.equal(initialized.protocolVersion, protocolVersion);
-      assert.equal(initialized.agentInfo?.name, "antigravity-acp");
+      assert.equal(initialized.agentInfo?.name, "Antigravity ACP Server");
 
       const exchange = <A, E>(effect: Effect.Effect<A, E>, method: string) =>
         Effect.gen(function* () {

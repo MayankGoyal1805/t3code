@@ -7,6 +7,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
+import { ANTIGRAVITY_CONVERSATION_SEGMENTS } from "./AntigravityChildWork.ts";
+import { errorStep } from "./AntigravityChildWork.testkit.ts";
 import { watchAntigravityPromptOutcome } from "./AntigravityTurnOutcome.ts";
 
 const USER_INPUT = 14;
@@ -14,14 +16,15 @@ const PLANNER_RESPONSE = 15;
 const TOOL = 8;
 const ERROR_MESSAGE = 17;
 
-// Error-step payloads trimmed from Antigravity 1.4.5 against a local Gemini endpoint.
-const errorPayload = (error: string) =>
-  Buffer.concat([
-    Buffer.from([0x0a, 0x24]),
-    Buffer.from(
-      `Agent execution terminated due to error.\u0012agent executor error: ${error}: ${error}\n(1) attached stack trace\n  -- stack trace:`,
-    ),
-  ]);
+// Error steps as agy 1.5.x writes them: the first line, then the same text with a Go stack trace.
+const errorPayload = (error: string) => {
+  const detail = `agent executor error: ${error}`;
+  return errorStep({
+    title: "Agent execution terminated due to error.",
+    detail,
+    full: `${detail}\n(1) attached stack trace\n  -- stack trace:\n  | main.run()`,
+  }).payload;
+};
 // An unparsable reset timestamp must not hide the reset delay, nor a retry delay outrank it.
 const QUOTA_ERROR = errorPayload(
   "Error 429, Message: Quota exhausted for test model., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.RetryInfo retryDelay:42s] map[@type:type.googleapis.com/google.rpc.ErrorInfo domain:googleapis.com metadata:map[quotaResetDelay:3600s quotaResetTimeStamp:soon] reason:QUOTA_EXHAUSTED]]",
@@ -44,7 +47,7 @@ describe("watchAntigravityPromptOutcome", () => {
       const path = yield* Path.Path;
       const profileDirectory = yield* fs.makeTempDirectoryScoped();
       const sessionId = "e6aba774-5472-4277-b6ee-27b2e05570a7";
-      const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+      const conversations = path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS);
       yield* fs.makeDirectory(conversations, { recursive: true });
       let nextIndex = 0;
       const appendSteps = (steps: ReadonlyArray<readonly [number, Uint8Array]>) => {
@@ -129,6 +132,34 @@ describe("watchAntigravityPromptOutcome", () => {
           retryable: false,
         },
       );
+      // An error that is not an API error fails with its first line, never the Go stack.
+      assert.deepEqual(
+        yield* turn([
+          [USER_INPUT, input],
+          [ERROR_MESSAGE, errorPayload("plan model not specified; you must specify a valid model")],
+        ]),
+        {
+          class: "provider_error",
+          message: "agent executor error: plan model not specified; you must specify a valid model",
+          code: null,
+          retryable: null,
+        },
+      );
+      // An error step that cannot be decoded or is oversized still fails the turn.
+      for (const payload of [Uint8Array.from([0xff, 0xff]), new Uint8Array(300 * 1024)]) {
+        assert.deepEqual(
+          yield* turn([
+            [USER_INPUT, input],
+            [ERROR_MESSAGE, payload],
+          ]),
+          {
+            class: "provider_error",
+            message: "Antigravity stopped this turn because of an error.",
+            code: null,
+            retryable: null,
+          },
+        );
+      }
       // A completed tool keeps its usage, and the turn still fails.
       assert.equal(
         (yield* turn(
@@ -166,7 +197,7 @@ describe("watchAntigravityPromptOutcome", () => {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const profileDirectory = yield* fs.makeTempDirectoryScoped();
-      const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+      const conversations = path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS);
       yield* fs.makeDirectory(conversations, { recursive: true });
       const own = "e6aba774-5472-4277-b6ee-27b2e05570a7";
       const peer = "0d9c2b4e-1111-4222-8333-944455556666";

@@ -37,6 +37,7 @@ import {
 import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 
 import { antigravityThinkingConfig } from "./acp/AntigravityAcpSupport.ts";
+import { isAntigravityRollbackVersionTested } from "./acp/AntigravityRollback.ts";
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
@@ -51,8 +52,19 @@ const PublishingUsage = Context.Reference<boolean>("t3/provider/AntigravityPubli
 
 type SessionSetupResult = Pick<
   AcpSessionRuntime.AcpSessionRuntimeStartResult["sessionSetupResult"],
-  "configOptions" | "models"
+  "configOptions" | "models" | "_meta"
 >;
+
+/** agy reports the account's plan, such as "Google AI Pro", as `_meta.antigravity.tier` (`{ name, id }`) on `session/new`. */
+function antigravityTier(setup: Pick<SessionSetupResult, "_meta">): string | undefined {
+  const antigravity = setup._meta?.antigravity;
+  const tier =
+    typeof antigravity === "object" && antigravity !== null && "tier" in antigravity
+      ? antigravity.tier
+      : undefined;
+  const name = typeof tier === "object" && tier !== null && "name" in tier ? tier.name : tier;
+  return typeof name === "string" && name.trim() ? name.trim() : undefined;
+}
 
 type ThinkingConfig = NonNullable<ReturnType<typeof antigravityThinkingConfig>>;
 
@@ -154,16 +166,24 @@ interface AntigravityProviderState {
   readonly authRevision: number;
 }
 
+export interface AntigravityProbeResult {
+  readonly initialize: EffectAcpSchema.InitializeResponse;
+  /** The account is signed out: agy answered "Authentication required". */
+  readonly authRequired?: boolean;
+}
+
 interface AntigravityProviderOptions {
   readonly stampIdentity: (snapshot: ServerProviderDraft) => Effect.Effect<ServerProvider>;
   readonly probe: Effect.Effect<
-    EffectAcpSchema.InitializeResponse,
+    AntigravityProbeResult,
     EffectAcpErrors.AcpError | ProviderSetupError
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
   readonly clearUsage?: Effect.Effect<void>;
-  readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
+  readonly resolveMaintenance?: (options?: {
+    readonly fresh?: boolean;
+  }) => Effect.Effect<ProviderMaintenanceCapabilities>;
   readonly auth?: { readonly type: string; readonly label: string };
 }
 
@@ -179,7 +199,15 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const authUncheckedMessage = usesCredentials
     ? `Antigravity is installed. Connect with ${options.auth.label} to load models.`
     : AUTH_UNCHECKED_MESSAGE;
+  const unauthenticatedAuth = {
+    status: "unauthenticated",
+    ...(usesCredentials ? options.auth : {}),
+  } as const;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const nextVersion = (version: string | null) => ({
+    version,
+    supportsConversationRollback: isAntigravityRollbackVersionTested(version ?? undefined),
+  });
   const initialDraft = {
     ...buildServerProvider({
       presentation: {
@@ -201,7 +229,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           : "Antigravity is disabled in T3 Code settings.",
       },
     }),
-    setup: { canAuthenticate: true, canInstall: true },
+    setup: { canAuthenticate: true, canInstall: false },
     supportsConversationRollback: false,
     supportsTextGeneration: false,
     workspaceSnapshots: [],
@@ -275,8 +303,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       Effect.timeoutOption(HEALTH_CHECK_TIMEOUT),
       Effect.result,
     );
-    const initialized =
+    const probed =
       Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
+    const initialized = probed?.initialize;
+    const authRequired = probed?.authRequired === true;
     const version = initialized?.agentInfo?.version;
     const failure = Result.isFailure(result) ? result.failure : undefined;
     const missingInstallation = failure !== undefined && isMissingInstallation(failure);
@@ -286,35 +316,46 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         : failure?._tag === "ProviderSetupError"
           ? failure.detail.trim() || "Antigravity could not complete its local health check."
           : missingInstallation
-            ? "Antigravity ACP runtime is not installed or its executable could not be found."
+            ? "The Antigravity CLI (agy) is not installed or could not be found."
             : failure
               ? "Antigravity could not complete its local health check."
               : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
     const supportsTextGeneration =
-      initialized !== undefined ? yield* options.supportsTextGeneration : false;
+      initialized !== undefined && !authRequired ? yield* options.supportsTextGeneration : false;
+    // A probe that began before a sign-in completed must not wipe what the sign-in discovered.
+    if (
+      authRequired &&
+      (yield* SubscriptionRef.get(metadata)).authRevision === before.authRevision
+    ) {
+      discoveredSkills.clear();
+      thinkingLevels.clear();
+      yield* resetUsage;
+    }
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
-      const authenticated = draft.auth.status === "authenticated";
+      const auth = authRequired ? unauthenticatedAuth : draft.auth;
+      const authenticated = auth.status === "authenticated";
       const message =
         errorMessage ??
         (authenticated
           ? undefined
-          : draft.auth.status === "unauthenticated"
+          : auth.status === "unauthenticated"
             ? signInMessage
             : authUncheckedMessage);
       return {
         ...state,
         draft: {
           ...draft,
+          auth,
           installed: !missingInstallation,
           // Lightweight custom-launcher probes lack versions; preserve the real handshake's version.
-          version: version === "unknown" ? draft.version : version || draft.version,
+          ...nextVersion(version === "unknown" ? draft.version : version || draft.version),
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
           checkedAt: updatedAt,
           usageLimits: missingInstallation ? undefined : draft.usageLimits,
-          ...(missingInstallation
+          ...(missingInstallation || authRequired
             ? {
                 models: [],
                 slashCommands: [],
@@ -325,26 +366,27 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             : {}),
           ...(initialized !== undefined
             ? {
-                supportsTextGeneration:
-                  supportsTextGeneration && draft.auth.status !== "unauthenticated",
+                supportsTextGeneration: supportsTextGeneration && auth.status !== "unauthenticated",
               }
             : {}),
           ...(message ? { message } : {}),
         },
       } satisfies AntigravityProviderState;
     });
-    if (initialized !== undefined) yield* refreshUsage();
+    if (initialized !== undefined && !authRequired) yield* refreshUsage();
     return yield* options.stampIdentity(next.draft);
   });
 
-  const maintenanceCapabilities =
-    options.maintenanceCapabilities ??
-    makeManualOnlyProviderMaintenanceCapabilities({
-      provider: ProviderDriverKind.make("antigravity"),
-      packageName: null,
-    });
   const managed = yield* makeManagedServerProvider({
-    resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+    resolveMaintenance:
+      options.resolveMaintenance ??
+      (() =>
+        Effect.succeed(
+          makeManualOnlyProviderMaintenanceCapabilities({
+            provider: ProviderDriverKind.make("antigravity"),
+            packageName: null,
+          }),
+        )),
     getSettings: Effect.succeed(settings),
     streamSettings: Stream.empty,
     haveSettingsChanged: () => false,
@@ -384,11 +426,14 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           ...draft,
           installed: true,
           status: "ready",
-          version: started.initializeResult.agentInfo?.version || draft.version,
+          ...nextVersion(started.initializeResult.agentInfo?.version || draft.version),
           auth: {
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            label:
+              antigravityTier(started.sessionSetupResult) ??
+              options.auth?.label ??
+              "Google account",
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
@@ -469,10 +514,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           authRevision: state.authRevision + 1,
           draft: {
             ...state.draft,
-            auth: {
-              status: "unauthenticated",
-              ...(usesCredentials ? options.auth : {}),
-            },
+            auth: unauthenticatedAuth,
             status: "warning",
             message: signInMessage,
             checkedAt: updatedAt,
@@ -519,6 +561,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
 
   return {
     snapshot: { ...managed, getSnapshot },
+    hasThinkingLevels: (model: string) => thinkingLevels.has(model),
     onSessionStarted,
     onConfigOptionsUpdated,
     onAvailableCommands,
