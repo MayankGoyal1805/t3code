@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/process";
@@ -731,166 +732,222 @@ describe("AntigravityAdapterV2 background work", () => {
   } as const;
   const hookLine = (name: string, fields: object) =>
     `${name}\t${JSON.stringify({ conversationId: SESSION, ...fields })}\n`;
+  const SECOND = { CommandLine: "sleep 30 && echo TWO", IsDaemon: false, WaitMsBeforeAsync: 500 };
   const jsonl = (steps: ReadonlyArray<object>) =>
     steps.map((step) => JSON.stringify(step)).join("\n") + "\n";
 
+  type PromptFrames = (
+    prompt: number,
+    send: (update: EffectAcpSchema.SessionUpdate) => Effect.Effect<void, EffectAcpErrors.AcpError>,
+  ) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+
+  const singleCommand: PromptFrames = (prompt, send) =>
+    prompt === 0
+      ? send({ sessionUpdate: "tool_call", ...commandFrame, status: "in_progress" }).pipe(
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "started" },
+            }),
+          ),
+        )
+      : // agy streams the wake it already reported through its hooks when the next prompt starts.
+        send({
+          sessionUpdate: "tool_call_update",
+          ...commandFrame,
+          status: "completed",
+          rawOutput: "Command exited with code 0.\n\nCommand output:\nONE",
+        }).pipe(
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "It printed ONE." },
+            }),
+          ),
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Nothing else." },
+            }),
+          ),
+        );
+
   // The mock agent is a subprocess and agy's hook events arrive through a real file watch.
+  const makeHarness = Effect.fn("AntigravityAdapterV2Test.makeBackgroundHarness")(function* (
+    promptFrames: PromptFrames,
+  ) {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* SecureRandom.SecureRandom;
+    const mockAgentPath = yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+    const profileDirectory = yield* fileSystem.makeTempDirectoryScoped();
+    const transcriptPath = path.join(profileDirectory, "transcript_full.jsonl");
+    let eventsFile: string | undefined;
+    let promptCount = 0;
+    let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+    const offers = yield* Queue.unbounded<void>();
+    const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+      [];
+    const instanceId = ProviderInstanceId.make("antigravity-background-test");
+    const threadId = ThreadId.make("thread-antigravity-background");
+    // The follower reads the transcript only once agy's Stop hook says the wake ended.
+    const transcriptRead = yield* Deferred.make<void>();
+    const watchedFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      stat: (target) =>
+        (target === transcriptPath
+          ? Deferred.succeed(transcriptRead, undefined)
+          : Effect.void
+        ).pipe(Effect.andThen(fileSystem.stat(target))),
+    };
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation: yield* resolveSelfInvocation(),
+      profileDirectory,
+      followBackgroundWork: true,
+      continuationRequests: {
+        offer: (request) =>
+          Effect.sync(() => {
+            continuationRequests.push(request);
+            Queue.offerUnsafe(offers, undefined);
+          }),
+      },
+      makeRuntime: (input) => {
+        eventsFile = input.hookEventsFile;
+        return makeAntigravityAcpRuntime({
+          ...input,
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: input.cwd,
+            env: { T3_ACP_ANTIGRAVITY: "1" },
+          },
+        }).pipe(
+          Effect.provideService(SecureRandom.SecureRandom, crypto),
+          Effect.map((runtime): RuntimeService => ({
+            ...runtime,
+            handleSessionUpdate: (handler) =>
+              Effect.sync(() => {
+                sessionUpdate = handler;
+              }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+            prompt: () =>
+              Effect.gen(function* () {
+                const send = (update: EffectAcpSchema.SessionUpdate) =>
+                  sessionUpdate === undefined
+                    ? Effect.die("the adapter must handle session updates")
+                    : sessionUpdate({ sessionId: SESSION, update });
+                yield* promptFrames(promptCount++, send);
+                return { stopReason: "end_turn" as const };
+              }),
+          })),
+        );
+      },
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+    }).pipe(Effect.provideService(FileSystem.FileSystem, watchedFileSystem));
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+    const session = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-session-antigravity-background"),
+      modelSelection,
+      runtimePolicy,
+    });
+    const providerThread = yield* session.ensureThread({
+      threadId,
+      modelSelection,
+      runtimePolicy,
+    });
+    const now = yield* DateTime.now;
+    const startTurn = (
+      ordinal: number,
+      message: {
+        createdBy: "user" | "agent";
+        creationSource: "web" | "provider";
+        text: string;
+      },
+    ) =>
+      session.startTurn({
+        appThread: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project-antigravity-background"),
+          title: "Antigravity background",
+          providerInstanceId: instanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+          activeProviderThreadId: providerThread.id,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+        threadId,
+        runId: RunId.make(`run-antigravity-background-${ordinal}`),
+        runOrdinal: ordinal,
+        providerTurnOrdinal: ordinal,
+        attemptId: RunAttemptId.make(`attempt-antigravity-background-${ordinal}`),
+        rootNodeId: NodeId.make(`node-antigravity-background-${ordinal}`),
+        providerThread,
+        message: {
+          ...message,
+          messageId: MessageId.make(`message-antigravity-background-${ordinal}`),
+          attachments: [],
+        },
+        modelSelection,
+        runtimePolicy,
+      });
+    const collectTurn = session.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runCollect,
+      Effect.map((events) => Array.from(events)),
+    );
+    return {
+      session,
+      startTurn,
+      collectTurn,
+      fileSystem,
+      transcriptPath,
+      eventsFile: () => eventsFile,
+      offers,
+      continuationRequests,
+      transcriptRead,
+    };
+  });
+
   it.live(
     "keeps a background command running past its turn and delivers its follow-up as a continuation",
     () =>
       Effect.gen(function* () {
-        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const crypto = yield* SecureRandom.SecureRandom;
-        const mockAgentPath = yield* path.fromFileUrl(
-          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
-        );
-        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
-        const profileDirectory = yield* fileSystem.makeTempDirectoryScoped();
-        const transcriptPath = path.join(profileDirectory, "transcript_full.jsonl");
-        let eventsFile: string | undefined;
-        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
-        const offered = yield* Deferred.make<void>();
-        const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
-          [];
-        const instanceId = ProviderInstanceId.make("antigravity-background-test");
-        const threadId = ThreadId.make("thread-antigravity-background");
-        // The follower reads the transcript only once agy's Stop hook says the wake ended.
-        const transcriptRead = yield* Deferred.make<void>();
-        const watchedFileSystem: FileSystem.FileSystem = {
-          ...fileSystem,
-          stat: (target) =>
-            (target === transcriptPath
-              ? Deferred.succeed(transcriptRead, undefined)
-              : Effect.void
-            ).pipe(Effect.andThen(fileSystem.stat(target))),
-        };
-        const adapter = yield* makeAntigravityAdapterV2({
-          instanceId,
-          selfInvocation: yield* resolveSelfInvocation(),
-          profileDirectory,
-          followBackgroundWork: true,
-          continuationRequests: {
-            offer: (request) =>
-              Effect.sync(() => {
-                continuationRequests.push(request);
-                Deferred.doneUnsafe(offered, Effect.void);
-              }),
-          },
-          makeRuntime: (input) => {
-            eventsFile = input.hookEventsFile;
-            return makeAntigravityAcpRuntime({
-              ...input,
-              childProcessSpawner,
-              spawn: {
-                command: process.execPath,
-                args: [mockAgentPath],
-                cwd: input.cwd,
-                env: { T3_ACP_ANTIGRAVITY: "1" },
-              },
-            }).pipe(
-              Effect.provideService(SecureRandom.SecureRandom, crypto),
-              Effect.map((runtime): RuntimeService => ({
-                ...runtime,
-                handleSessionUpdate: (handler) =>
-                  Effect.sync(() => {
-                    sessionUpdate = handler;
-                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
-                prompt: () =>
-                  Effect.gen(function* () {
-                    const send = (update: EffectAcpSchema.SessionUpdate) =>
-                      sessionUpdate === undefined
-                        ? Effect.die("the adapter must handle session updates")
-                        : sessionUpdate({ sessionId: SESSION, update });
-                    yield* send({
-                      sessionUpdate: "tool_call",
-                      ...commandFrame,
-                      status: "in_progress",
-                    });
-                    yield* send({
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "started" },
-                    });
-                    return { stopReason: "end_turn" as const };
-                  }),
-              })),
-            );
-          },
-          withProcess: (_stop, task) => task,
-          defaultModel: Effect.undefined,
-        }).pipe(Effect.provideService(FileSystem.FileSystem, watchedFileSystem));
-        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          cwd: process.cwd(),
-        });
-        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
-        const session = yield* adapter.openSession({
-          threadId,
-          providerSessionId: ProviderSessionId.make("provider-session-antigravity-background"),
-          modelSelection,
-          runtimePolicy,
-        });
-        const providerThread = yield* session.ensureThread({
-          threadId,
-          modelSelection,
-          runtimePolicy,
-        });
-        const now = yield* DateTime.now;
-        const startTurn = (
-          ordinal: number,
-          message: {
-            createdBy: "user" | "agent";
-            creationSource: "web" | "provider";
-            text: string;
-          },
-        ) =>
-          session.startTurn({
-            appThread: {
-              createdBy: "user",
-              creationSource: "web",
-              id: threadId,
-              projectId: ProjectId.make("project-antigravity-background"),
-              title: "Antigravity background",
-              providerInstanceId: instanceId,
-              modelSelection,
-              runtimeMode: "full-access",
-              interactionMode: "default",
-              branch: null,
-              worktreePath: process.cwd(),
-              activeProviderThreadId: providerThread.id,
-              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-              forkedFrom: null,
-              createdAt: now,
-              updatedAt: now,
-              archivedAt: null,
-              settledOverride: null,
-              settledAt: null,
-              lastVisitedAt: null,
-              deletedAt: null,
-            },
-            threadId,
-            runId: RunId.make(`run-antigravity-background-${ordinal}`),
-            runOrdinal: ordinal,
-            providerTurnOrdinal: ordinal,
-            attemptId: RunAttemptId.make(`attempt-antigravity-background-${ordinal}`),
-            rootNodeId: NodeId.make(`node-antigravity-background-${ordinal}`),
-            providerThread,
-            message: {
-              ...message,
-              messageId: MessageId.make(`message-antigravity-background-${ordinal}`),
-              attachments: [],
-            },
-            modelSelection,
-            runtimePolicy,
-          });
-        const collectTurn = session.events.pipe(
-          Stream.takeUntil((event) => event.type === "turn.terminal"),
-          Stream.runCollect,
-          Effect.map((events) => Array.from(events)),
-        );
-
+        const h = yield* makeHarness(singleCommand);
+        const {
+          session,
+          startTurn,
+          collectTurn,
+          fileSystem,
+          transcriptPath,
+          offers,
+          continuationRequests,
+          transcriptRead,
+        } = h;
         yield* startTurn(1, {
           createdBy: "user",
           creationSource: "web",
@@ -906,7 +963,7 @@ describe("AntigravityAdapterV2 background work", () => {
         );
         assert.equal(commandItems.at(-1), "running");
         assert.isTrue(yield* session.hasPendingBackgroundWork!);
-        assert.isDefined(eventsFile);
+        assert.isDefined(h.eventsFile());
 
         // agy's model is still answering when the Stop hook lands: the transcript has the wake
         // message but not yet the follow-up, as in the live run where the first run closed early.
@@ -928,7 +985,7 @@ describe("AntigravityAdapterV2 background work", () => {
         yield* fileSystem.writeFileString(transcriptPath, jsonl(beforeAnswer));
         const common = { transcriptPath };
         yield* fileSystem.writeFileString(
-          eventsFile!,
+          h.eventsFile()!,
           hookLine("Stop", { ...common, fullyIdle: false }) +
             hookLine("PostToolUse", {
               ...common,
@@ -943,7 +1000,7 @@ describe("AntigravityAdapterV2 background work", () => {
         // The card is held with its follow-up, so no run starts before the model has answered.
         assert.lengthOf(continuationRequests, 0);
         yield* fileSystem.writeFileString(transcriptPath, jsonl([...beforeAnswer, answer]));
-        yield* Deferred.await(offered);
+        yield* Queue.take(offers);
 
         yield* startTurn(2, {
           createdBy: "agent",
@@ -961,7 +1018,146 @@ describe("AntigravityAdapterV2 background work", () => {
         assert.equal(reply?.type === "assistant_message" && reply.text, "It printed ONE.");
         assert.lengthOf(continuationRequests, 1);
         assert.isFalse(yield* session.hasPendingBackgroundWork!);
+
+        // The next prompt makes agy stream the wake again; none of it may show up in that turn.
+        yield* startTurn(3, { createdBy: "user", creationSource: "web", text: "anything else?" });
+        const next = (yield* collectTurn).flatMap((event) =>
+          event.type === "turn_item.updated" ? [event.turnItem] : [],
+        );
+        assert.isUndefined(next.find((item) => item.type === "command_execution"));
+        assert.deepEqual(
+          [
+            ...new Set(
+              next.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
+            ),
+          ],
+          ["Nothing else."],
+        );
       }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  const twoCommands: PromptFrames = (prompt, send) =>
+    prompt === 0
+      ? send({ sessionUpdate: "tool_call", ...commandFrame, status: "in_progress" }).pipe(
+          Effect.andThen(
+            send({
+              sessionUpdate: "tool_call",
+              ...commandFrame,
+              toolCallId: "call_2",
+              title: SECOND.CommandLine,
+              rawInput: SECOND,
+              status: "in_progress",
+            }),
+          ),
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "started" },
+            }),
+          ),
+        )
+      : Effect.void;
+
+  const wakeMessage = (step: number, task: number, output: string) => ({
+    step_index: step,
+    type: "SYSTEM_MESSAGE",
+    status: "DONE",
+    content: `<SYSTEM_MESSAGE>\n[Message] timestamp=t sender=${SESSION}/task-${task} priority=HIGH content=Task id "${SESSION}/task-${task}" finished with result:\nCommand exited with code 0.\n\nCommand output:\n${output}\r\n\nLog: file:///x\n</SYSTEM_MESSAGE>`,
+  });
+  const answerStep = (step: number, content: string) => ({
+    step_index: step,
+    type: "PLANNER_RESPONSE",
+    status: "DONE",
+    content,
+  });
+
+  it.live("delivers each of two background tasks in its own continuation run", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness(twoCommands);
+      const { session, startTurn, collectTurn, fileSystem, transcriptPath, offers } = h;
+      yield* startTurn(1, { createdBy: "user", creationSource: "web", text: "run two commands" });
+      yield* collectTurn;
+      assert.isDefined(h.eventsFile());
+      const common = { transcriptPath };
+      const itemsOf = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+        events.flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
+
+      // The first wake stops while the second command is still running.
+      yield* fileSystem.writeFileString(
+        transcriptPath,
+        jsonl([wakeMessage(4, 2, "ONE"), answerStep(5, "ONE finished.")]),
+      );
+      yield* fileSystem.writeFileString(
+        h.eventsFile()!,
+        hookLine("Stop", { ...common, fullyIdle: false }) +
+          hookLine("PostToolUse", {
+            ...common,
+            stepIdx: 2,
+            toolCall: { name: "run_command", args: COMMAND },
+            error: "",
+          }) +
+          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
+          hookLine("Stop", { ...common, fullyIdle: false }),
+      );
+      yield* Queue.take(offers);
+      yield* startTurn(2, {
+        createdBy: "agent",
+        creationSource: "provider",
+        text: "Background task completed.",
+      });
+      const first = itemsOf(yield* collectTurn);
+      const firstCard = first.findLast((item) => item.type === "command_execution");
+      assert.equal(firstCard?.type === "command_execution" && firstCard.output, "ONE");
+      assert.deepEqual(
+        [
+          ...new Set(
+            first.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
+          ),
+        ],
+        ["ONE finished."],
+      );
+      assert.isTrue(yield* session.hasPendingBackgroundWork!);
+
+      yield* fileSystem.writeFileString(
+        transcriptPath,
+        jsonl([
+          wakeMessage(4, 2, "ONE"),
+          answerStep(5, "ONE finished."),
+          wakeMessage(6, 3, "TWO"),
+          answerStep(7, "TWO finished."),
+        ]),
+      );
+      yield* fileSystem.writeFileString(
+        h.eventsFile()!,
+        hookLine("PostToolUse", {
+          ...common,
+          stepIdx: 3,
+          toolCall: { name: "run_command", args: SECOND },
+          error: "",
+        }) +
+          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 6 }) +
+          hookLine("Stop", { ...common, fullyIdle: true }),
+        { flag: "a" },
+      );
+      yield* Queue.take(offers);
+      yield* startTurn(3, {
+        createdBy: "agent",
+        creationSource: "provider",
+        text: "Background task completed.",
+      });
+      const second = itemsOf(yield* collectTurn);
+      const secondCard = second.findLast((item) => item.type === "command_execution");
+      assert.equal(secondCard?.type === "command_execution" && secondCard.output, "TWO");
+      assert.deepEqual(
+        [
+          ...new Set(
+            second.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
+          ),
+        ],
+        ["TWO finished."],
+      );
+      assert.isFalse(yield* session.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
 

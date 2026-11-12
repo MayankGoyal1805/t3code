@@ -336,6 +336,142 @@ describe("AntigravityBackgroundFollower", () => {
   });
 });
 
+// Two background commands from one prompt that follows an earlier wake, as agy 1.5.x recorded them.
+describe("AntigravityBackgroundFollower with two tasks after an earlier wake", () => {
+  const priorWake = [
+    {
+      step_index: 0,
+      type: "USER_INPUT",
+      status: "DONE",
+      content: "<USER_REQUEST>A</USER_REQUEST>",
+    },
+    { step_index: 3, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
+    { step_index: 4, type: "SYSTEM_MESSAGE", status: "DONE", content: finished(2, "ZEBRA7") },
+    { step_index: 5, type: "PLANNER_RESPONSE", status: "DONE", content: "ZEBRA7 done." },
+  ];
+  const second = [
+    {
+      step_index: 6,
+      type: "USER_INPUT",
+      status: "DONE",
+      content: "<USER_REQUEST>B</USER_REQUEST>",
+    },
+    {
+      step_index: 7,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      tool_calls: [
+        { name: "run_command", args: ONE },
+        { name: "run_command", args: TWO },
+      ],
+    },
+    { step_index: 8, type: "GENERIC", status: "RUNNING", content: `task id: ${ROOT}/task-8` },
+    { step_index: 9, type: "GENERIC", status: "RUNNING", content: `task id: ${ROOT}/task-9` },
+    { step_index: 10, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
+    { step_index: 11, type: "SYSTEM_MESSAGE", status: "DONE", content: finished(8, "ONE") },
+    { step_index: 12, type: "PLANNER_RESPONSE", status: "DONE", content: "ONE finished." },
+    { step_index: 13, type: "SYSTEM_MESSAGE", status: "DONE", content: finished(9, "TWO") },
+    { step_index: 14, type: "PLANNER_RESPONSE", status: "DONE", content: "TWO finished." },
+  ];
+
+  function afterFirstWake() {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    follower.toolObserved({
+      toolCallId: "call_1",
+      name: "run_command",
+      rawInput: ONE,
+      status: "open",
+    });
+    follower.toolObserved({
+      toolCallId: "call_2",
+      name: "run_command",
+      rawInput: TWO,
+      status: "open",
+    });
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 7 }));
+    follower.hook(hook("PreInvocation", { invocationNum: 1, initialNumSteps: 10 }));
+    follower.hook(hook("Stop", { fullyIdle: false }));
+    follower.promptReturned();
+    return follower;
+  }
+
+  it("delivers each wake with only its own card and text, though the first Stop is not idle", () => {
+    const follower = afterFirstWake();
+    follower.hook(postToolUse(8, ONE));
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 11 }));
+    follower.hook(hook("Stop", { fullyIdle: false }));
+    // The transcript may already hold the second wake when the first is read late.
+    const first = follower.transcript(transcript(priorWake, second));
+    assert.deepEqual(summarize(first.updates), [
+      ["tool_call_update", "call_1", "completed"],
+      ["agent_message_chunk", "ONE finished.", null],
+    ]);
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_2"]);
+
+    follower.hook(postToolUse(9, TWO));
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 13 }));
+    follower.hook(hook("Stop", { fullyIdle: true }));
+    const last = follower.transcript(transcript(priorWake, second));
+    assert.deepEqual(summarize(last.updates), [
+      ["tool_call_update", "call_2", "completed"],
+      ["agent_message_chunk", "TWO finished.", null],
+    ]);
+  });
+
+  it("matches the finished task by the tool call id agy now names", () => {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    follower.toolObserved({
+      toolCallId: "call_1",
+      name: "run_command",
+      rawInput: ONE,
+      status: "open",
+    });
+    follower.toolObserved({
+      toolCallId: "call_2",
+      name: "run_command",
+      rawInput: ONE,
+      status: "open",
+    });
+    follower.hook(hook("Stop", { fullyIdle: false }));
+    follower.promptReturned();
+    follower.hook(
+      hook("PostToolUse", {
+        stepIdx: 9,
+        toolCall: { name: "run_command", args: ONE, id: "call_2" },
+      }),
+    );
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_1"]);
+  });
+
+  it("does not replay a delivered wake into the next prompt", () => {
+    const follower = afterFirstWake();
+    follower.hook(postToolUse(8, ONE));
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 11 }));
+    follower.hook(hook("Stop", { fullyIdle: false }));
+    follower.transcript(transcript(priorWake, second));
+
+    // agy streams the wake it already reported once the next prompt starts.
+    follower.promptStarted();
+    const replayedCard = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "call_1",
+      status: "completed",
+    } as const;
+    assert.isTrue(follower.isReplay(replayedCard));
+    const text = (value: string) =>
+      ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } }) as const;
+    assert.isTrue(follower.isReplay(text("ONE fin")));
+    assert.isTrue(follower.isReplay(text("ished.")));
+    assert.isFalse(follower.isReplay(text("ONE finished.")));
+    assert.isFalse(follower.isReplay({ ...replayedCard, toolCallId: "call_2" }));
+    assert.isFalse(follower.isReplay(text("a fresh answer")));
+  });
+});
+
 describe("parseAntigravityTaskMessage", () => {
   it("reads the task, exit code and output of a finished command", () => {
     assert.deepEqual(parseAntigravityTaskMessage(finished(2, "ONE\nTWO")), {

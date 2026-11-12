@@ -420,10 +420,12 @@ function followBackgroundWork(
           );
         }
         return yield* runtime.handleSessionUpdate((notification) =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
             const { update } = notification;
+            if (notification.sessionId !== rootSessionId) return handler(notification);
+            // The next prompt makes agy stream the wake it already reported through its hooks.
+            if (follower.isReplay(update)) return Effect.void;
             if (
-              notification.sessionId === rootSessionId &&
               (update.sessionUpdate === "tool_call" ||
                 update.sessionUpdate === "tool_call_update") &&
               isAntigravityBackgroundToolName(update.name)
@@ -436,7 +438,8 @@ function followBackgroundWork(
                   update.status === "completed" || update.status === "failed" ? "settled" : "open",
               });
             }
-          }).pipe(Effect.andThen(handler(notification))),
+            return handler(notification);
+          }),
         );
       },
     ),
@@ -589,6 +592,7 @@ export function makeAntigravityAcpAdapterFlavor(
     ...(followsBackgroundWork
       ? {
           enablePostSettleContinuation: true,
+          wakeNotificationsAreComplete: true,
           // Commands and timers outlive the turn: they pin the session but never hold the run open.
           extractBackgroundTaskId: (toolCall) =>
             backgroundHooksLive && isAntigravityBackgroundToolName(toolCall.data.name)

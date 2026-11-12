@@ -147,7 +147,8 @@ transcript the hook points at (the content source, plain JSONL) into synthetic A
 as wakes, so the shared adapter's post-settle continuation path starts the new run. A wake is a
 `PreInvocation` with no prompt in flight after a background task's `PostToolUse`; that is what
 separates it from a subagent wake, which the session-log tracker owns. Background tasks pin the
-session but never hold the turn open. The
+session but never hold the turn open. A finished task is reported with its wake's follow-up, one run per
+wake, and `agy` streams that wake again at the next prompt, which the wrapper drops. The
 [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
 rejects revert before touching files when a provider reports no rollback support. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.

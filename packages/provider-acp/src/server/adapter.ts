@@ -526,6 +526,12 @@ export interface AcpAdapterV2Flavor {
     notification: EffectAcpSchema.SessionNotification,
   ) => boolean;
   readonly deferFinalizeForBackgroundWork?: boolean;
+  /**
+   * Each wake notification is a complete report of one wake, so the heuristics that guess
+   * whether post-settle output is chatter about work already handled, or belongs to a task that
+   * is still running, do not apply to it.
+   */
+  readonly wakeNotificationsAreComplete?: boolean;
   readonly assertComplete?: Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Interrupt the local prompt fiber before `session/cancel` (Grok wedged prompts). */
   readonly interruptPromptOnCancel?: boolean;
@@ -4809,8 +4815,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }
             }
           }
-          const backgroundWorkRunning = (yield* Ref.get(runningBackgroundTaskIds)).size > 0;
-          const handledInTurnCount = (yield* Ref.get(handledBackgroundTaskIdsInActiveTurn)).size;
+          const completeWake =
+            flavor.wakeNotificationsAreComplete === true &&
+            flavor.isProviderWakeNotification?.(notification) === true;
+          const backgroundWorkRunning =
+            !completeWake && (yield* Ref.get(runningBackgroundTaskIds)).size > 0;
+          const handledInTurnCount = completeWake
+            ? 0
+            : (yield* Ref.get(handledBackgroundTaskIdsInActiveTurn)).size;
           const isInTurnHandledAgentChatter =
             handledInTurnCount > 0 &&
             (update.sessionUpdate === "agent_message_chunk" ||
@@ -5126,6 +5138,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (
             context !== null &&
             context.finalized &&
+            !(
+              flavor.wakeNotificationsAreComplete === true &&
+              flavor.isProviderWakeNotification?.(notification) === true
+            ) &&
             (yield* Ref.get(handledBackgroundTaskIdsInActiveTurn)).size > 0 &&
             (update.sessionUpdate === "agent_message_chunk" ||
               update.sessionUpdate === "agent_thought_chunk")

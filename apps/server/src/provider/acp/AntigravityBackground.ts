@@ -108,6 +108,9 @@ export function makeAntigravityBackgroundFollower() {
   let wake: Wake | undefined;
   let cursor = -1;
   /** Finished while no prompt ran: reported with the wake's follow-up so one run carries both. */
+  /** Tool calls and texts already delivered by a wake; agy streams them again at the next prompt. */
+  const reported = new Set<string>();
+  let replayableTexts: string[] = [];
   let held: Array<{ readonly tool: TrackedTool; readonly error: string | null | undefined }> = [];
   let transcriptPath: string | undefined;
   const tools = new Map<string, TrackedTool>();
@@ -164,6 +167,7 @@ export function makeAntigravityBackgroundFollower() {
     const { failed, known, rawOutput } = outputFor(tool, error);
     tool.needsOutput = !known;
     tool.failed = failed;
+    reported.add(tool.toolCallId);
     return toolUpdate(
       tool,
       {
@@ -228,6 +232,7 @@ export function makeAntigravityBackgroundFollower() {
       if (step.type === "PLANNER_RESPONSE") {
         const text = stripAntigravityGoalMarker(step.content ?? "");
         if (text.trim().length > 0) {
+          replayableTexts.push(text);
           updates.push({
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text },
@@ -279,6 +284,8 @@ export function makeAntigravityBackgroundFollower() {
       pendingWakes = 0;
       cursor = -1;
       held = [];
+      reported.clear();
+      replayableTexts = [];
       knownMessages.clear();
     },
 
@@ -307,7 +314,32 @@ export function makeAntigravityBackgroundFollower() {
       pendingWakes = 0;
     },
 
+    /** agy's own re-stream of a wake already delivered: its tool calls by id, its text in order. */
+    isReplay(update: SessionUpdate): boolean {
+      if (
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+        reported.has(update.toolCallId)
+      ) {
+        return true;
+      }
+      if (update.sessionUpdate !== "agent_message_chunk" || update.content.type !== "text") {
+        return false;
+      }
+      const expected = replayableTexts[0];
+      const chunk = update.content.text;
+      if (expected === undefined || !promptInFlight) return false;
+      if (chunk.length > 0 && expected.startsWith(chunk)) {
+        const rest = expected.slice(chunk.length);
+        if (rest.length === 0) replayableTexts.shift();
+        else replayableTexts[0] = rest;
+        return true;
+      }
+      replayableTexts = [];
+      return false;
+    },
+
     promptReturned() {
+      replayableTexts = [];
       promptInFlight = false;
       if (busyStopDuringPrompt) confirmBackground();
       busyStopDuringPrompt = false;
@@ -331,6 +363,7 @@ export function makeAntigravityBackgroundFollower() {
       for (const tool of tools.values()) {
         if (tool.done || tool.background) continue;
         tool.done = true;
+        reported.add(tool.toolCallId);
         updates.push(toolUpdate(tool, { status: "failed", rawOutput: reason }, "tool_call_update"));
       }
       return updates;
@@ -378,13 +411,14 @@ export function makeAntigravityBackgroundFollower() {
         case "PostToolUse": {
           if (event.toolCall === undefined) return { updates: [] };
           const args = canonical(event.toolCall.args ?? null);
-          const tool = [...tools.values()].find(
+          const open = [...tools.values()].filter(
             (candidate) =>
-              candidate.background &&
-              !candidate.done &&
-              candidate.name === event.toolCall!.name &&
-              canonical(candidate.args ?? null) === args,
+              candidate.background && !candidate.done && candidate.name === event.toolCall!.name,
           );
+          // agy 1.5.x names the tool call in its hook; older runs are matched by their arguments.
+          const tool =
+            open.find((candidate) => candidate.toolCallId === event.toolCall!.id) ??
+            open.find((candidate) => canonical(candidate.args ?? null) === args);
           if (tool === undefined) return { updates: [] };
           tool.done = true;
           tool.stepIdx = event.stepIdx;
@@ -431,8 +465,14 @@ export function makeAntigravityBackgroundFollower() {
         if (message !== undefined) knownMessages.set(message.stepIdx, message);
       }
       if (wake === undefined || !wake.stopped) return { updates: fillOutputs(), incomplete: false };
-      const fresh = steps.filter((step) => step.step_index >= wake!.from);
-      const triggered = fresh.findIndex((step) => step.type === "SYSTEM_MESSAGE");
+      const inRange = steps.filter((step) => step.step_index >= wake!.from);
+      const triggered = inRange.findIndex((step) => step.type === "SYSTEM_MESSAGE");
+      // A later wake's message ends this one; its steps belong to its own run.
+      const nextWake =
+        triggered < 0
+          ? -1
+          : inRange.findIndex((step, index) => index > triggered && step.type === "SYSTEM_MESSAGE");
+      const fresh = nextWake < 0 ? inRange : inRange.slice(0, nextWake);
       const answered = fresh
         .slice(Math.max(0, triggered))
         .some((step) => step.type === "PLANNER_RESPONSE");

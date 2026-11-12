@@ -11,7 +11,11 @@ const HookPayload = Schema.Struct({
   invocationNum: Schema.optional(Schema.Int),
   initialNumSteps: Schema.optional(Schema.Int),
   toolCall: Schema.optional(
-    Schema.Struct({ name: Schema.String, args: Schema.optional(Schema.Unknown) }),
+    Schema.Struct({
+      name: Schema.String,
+      args: Schema.optional(Schema.Unknown),
+      id: Schema.optional(Schema.NullOr(Schema.String)),
+    }),
   ),
   error: Schema.optional(Schema.NullOr(Schema.String)),
   fullyIdle: Schema.optional(Schema.Boolean),
