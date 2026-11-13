@@ -147,8 +147,13 @@ transcript the hook points at (the content source, plain JSONL) into synthetic A
 as wakes, so the shared adapter's post-settle continuation path starts the new run. A wake is a
 `PreInvocation` with no prompt in flight after a background task's `PostToolUse`; that is what
 separates it from a subagent wake, which the session-log tracker owns. Background tasks pin the
-session but never hold the turn open. A finished task is reported with its wake's follow-up, one run per
-wake, and `agy` streams that wake again at the next prompt, which the wrapper drops. The
+session but never hold the turn open. The wake streams live: the card completes at `PostToolUse`
+(output from the task log, which exists before the transcript has it), and each later hook
+(`PreToolUse`, `PreInvocation`, `Stop`) triggers a transcript read that delivers new text and tools
+into the one run the wake owns, which stays open (`isProviderWakeInProgress`) until its `Stop`. Text-only
+planner steps are held until something follows them because `agy` can reject one with an error
+step and retry. `agy` streams the wake again at the next prompt; the wrapper drops what the wake
+already showed, matching tools by id or, when `agy` names none, by command. The
 [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
 rejects revert before touching files when a provider reports no rollback support. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.

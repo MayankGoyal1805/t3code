@@ -21,9 +21,10 @@ const HookPayload = Schema.Struct({
   fullyIdle: Schema.optional(Schema.Boolean),
 });
 
-export type AntigravityHookName = "PreInvocation" | "PostToolUse" | "Stop";
+export type AntigravityHookName = "PreInvocation" | "PreToolUse" | "PostToolUse" | "Stop";
 const HOOK_NAMES: ReadonlySet<string> = new Set<AntigravityHookName>([
   "PreInvocation",
+  "PreToolUse",
   "PostToolUse",
   "Stop",
 ]);

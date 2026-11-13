@@ -326,11 +326,11 @@ function followSubagentWake(
   };
 }
 
-/** The transcript can trail the Stop hook by a moment; a few re-reads, never a loop that runs on. */
+/** The transcript can trail the Stop hook by a moment; a bounded wait for the follow-up's last step. */
 const TRANSCRIPT_RETRY_DELAY = "500 millis";
-const TRANSCRIPT_MAX_READS = 6;
-/** A finished task's card waits for its wake's follow-up so one run carries both; a missing Stop must not hold it forever. */
-const WAKE_HOLD_CAP = "90 seconds";
+const TRANSCRIPT_MAX_RETRIES = 30;
+/** A wake whose Stop never arrives must not hold its run open for ever; any hook for it restarts this. */
+const WAKE_IDLE_CAP = "15 minutes";
 
 /**
  * agy reports nothing when a background command or timer ends, or for the follow-up it then runs.
@@ -342,11 +342,16 @@ function followBackgroundWork(
   scope: Scope.Scope,
   fileSystem: FileSystem.FileSystem,
   eventsFile: string,
+  holdRun: (inProgress: () => boolean) => void,
 ): AntigravityRuntime {
   const follower = makeAntigravityBackgroundFollower();
+  holdRun(() => follower.wakeInProgress());
   let deliver: Parameters<AntigravityRuntime["handleSessionUpdate"]>[0] | undefined;
   let rootSessionId: string | undefined;
   let tailing = false;
+  let transcriptPath: string | undefined;
+  let settling: Fiber.Fiber<void> | undefined;
+  let cap: Fiber.Fiber<void> | undefined;
 
   const send = (updates: ReadonlyArray<EffectAcpSchema.SessionUpdate>) =>
     Effect.forEach(
@@ -358,19 +363,46 @@ function followBackgroundWork(
       { discard: true },
     );
 
-  const followTranscript = Effect.fn("AntigravityAdapterV2.followTranscript")(function* (
-    transcriptPath: string,
+  const ingest = Effect.fn("AntigravityAdapterV2.ingestBackgroundWork")(function* (
+    read: NonNullable<ReturnType<typeof follower.hook>["read"]>,
   ) {
-    for (let read = 0; read < TRANSCRIPT_MAX_READS; read++) {
-      const steps = yield* readAntigravityTranscript(transcriptPath, 0).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-      );
-      const result = follower.transcript(steps);
-      yield* send(result.updates);
-      if (!result.incomplete) return;
+    transcriptPath = read.transcriptPath;
+    const steps = yield* readAntigravityTranscript(read.transcriptPath, follower.readFrom()).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+    );
+    const log = read.taskLog;
+    const text =
+      log === undefined
+        ? undefined
+        : yield* fileSystem.readFileString(log.path).pipe(Effect.orElseSucceed(() => undefined));
+    yield* send(
+      follower.ingest({
+        steps,
+        ...(log === undefined || text === undefined
+          ? {}
+          : { taskLog: { toolCallId: log.toolCallId, text } }),
+      }),
+    );
+  });
+
+  // The wake has stopped but its last step is not written yet: read again, a bounded number of times.
+  const settle = Effect.fn("AntigravityAdapterV2.settleBackgroundWake")(function* () {
+    for (let retry = 0; retry < TRANSCRIPT_MAX_RETRIES && follower.awaitingFinal(); retry++) {
       yield* Effect.sleep(TRANSCRIPT_RETRY_DELAY);
+      if (transcriptPath !== undefined) yield* ingest({ transcriptPath });
     }
-    yield* send(follower.flush());
+    if (follower.awaitingFinal()) yield* send(follower.endWake());
+  });
+
+  const guardWake = Effect.fn("AntigravityAdapterV2.guardBackgroundWake")(function* () {
+    const previous = cap;
+    cap = undefined;
+    if (previous !== undefined) yield* Fiber.interrupt(previous);
+    if (!follower.wakeInProgress()) return;
+    cap = yield* Effect.sleep(WAKE_IDLE_CAP).pipe(
+      Effect.andThen(Effect.suspend(() => send(follower.endWake()))),
+      Effect.forkIn(scope),
+    );
   });
 
   const onHook = Effect.fn("AntigravityAdapterV2.followBackgroundHook")(function* (
@@ -378,13 +410,19 @@ function followBackgroundWork(
   ) {
     const step = follower.hook(event);
     yield* send(step.updates);
-    if (follower.holding()) {
-      yield* Effect.sleep(WAKE_HOLD_CAP).pipe(
-        Effect.andThen(Effect.suspend(() => send(follower.flush()))),
+    if (step.read !== undefined) yield* ingest(step.read);
+    if (follower.awaitingFinal() && settling === undefined) {
+      const fiber = yield* settle().pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (settling === fiber) settling = undefined;
+          }),
+        ),
         Effect.forkIn(scope),
       );
+      settling = fiber;
     }
-    if (step.read !== undefined) yield* followTranscript(step.read.transcriptPath);
+    yield* guardWake();
   });
 
   const started = <A extends { readonly sessionId: string }, E, R>(
@@ -466,6 +504,7 @@ export function makeAntigravityAcpAdapterFlavor(
     options.followBackgroundWork === true && profileDirectory !== undefined;
   // Tasks are tracked only once hooks are registered; otherwise nothing would ever end them.
   let backgroundHooksLive = false;
+  let wakeInProgress = () => false;
   const missingConversation = (sessionId: string) =>
     new EffectAcpErrors.AcpRequestError({
       code: -32002,
@@ -517,7 +556,15 @@ export function makeAntigravityAcpAdapterFlavor(
       const background =
         hookEventsFile === undefined
           ? runtime
-          : followBackgroundWork(runtime, scope, options.fileSystem, hookEventsFile);
+          : followBackgroundWork(
+              runtime,
+              scope,
+              options.fileSystem,
+              hookEventsFile,
+              (inProgress) => {
+                wakeInProgress = inProgress;
+              },
+            );
       const followed =
         profileDirectory === undefined
           ? background
@@ -599,6 +646,7 @@ export function makeAntigravityAcpAdapterFlavor(
               ? toolCall.toolCallId
               : undefined,
           isPersistentBackgroundTool: () => true,
+          isProviderWakeInProgress: () => wakeInProgress(),
           isProviderWakeNotification: (notification) => {
             const meta: unknown =
               "_meta" in notification.update ? notification.update._meta : undefined;

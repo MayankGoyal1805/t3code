@@ -16,6 +16,7 @@ import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -785,7 +786,11 @@ describe("AntigravityAdapterV2 background work", () => {
     );
     type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
     const profileDirectory = yield* fileSystem.makeTempDirectoryScoped();
-    const transcriptPath = path.join(profileDirectory, "transcript_full.jsonl");
+    const systemDirectory = path.join(profileDirectory, ".system_generated");
+    const transcriptPath = path.join(systemDirectory, "logs", "transcript_full.jsonl");
+    const taskLogPath = (task: number) => path.join(systemDirectory, "tasks", `task-${task}.log`);
+    yield* fileSystem.makeDirectory(path.dirname(transcriptPath), { recursive: true });
+    yield* fileSystem.makeDirectory(path.dirname(taskLogPath(0)), { recursive: true });
     let eventsFile: string | undefined;
     let promptCount = 0;
     let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
@@ -794,16 +799,6 @@ describe("AntigravityAdapterV2 background work", () => {
       [];
     const instanceId = ProviderInstanceId.make("antigravity-background-test");
     const threadId = ThreadId.make("thread-antigravity-background");
-    // The follower reads the transcript only once agy's Stop hook says the wake ended.
-    const transcriptRead = yield* Deferred.make<void>();
-    const watchedFileSystem: FileSystem.FileSystem = {
-      ...fileSystem,
-      stat: (target) =>
-        (target === transcriptPath
-          ? Deferred.succeed(transcriptRead, undefined)
-          : Effect.void
-        ).pipe(Effect.andThen(fileSystem.stat(target))),
-    };
     const adapter = yield* makeAntigravityAdapterV2({
       instanceId,
       selfInvocation: yield* resolveSelfInvocation(),
@@ -849,7 +844,7 @@ describe("AntigravityAdapterV2 background work", () => {
       },
       withProcess: (_stop, task) => task,
       defaultModel: Effect.undefined,
-    }).pipe(Effect.provideService(FileSystem.FileSystem, watchedFileSystem));
+    });
     const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
       runtimeMode: "full-access",
       interactionMode: "default",
@@ -926,28 +921,30 @@ describe("AntigravityAdapterV2 background work", () => {
       collectTurn,
       fileSystem,
       transcriptPath,
+      taskLogPath,
       eventsFile: () => eventsFile,
       offers,
       continuationRequests,
-      transcriptRead,
     };
   });
 
+  const itemsOf = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+    events.flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
+  const repliesOf = (items: ReturnType<typeof itemsOf>) => [
+    ...new Set(items.flatMap((item) => (item.type === "assistant_message" ? [item.text] : []))),
+  ];
+  const providerContinuation = {
+    createdBy: "agent",
+    creationSource: "provider",
+    text: "Background task completed.",
+  } as const;
+
   it.live(
-    "keeps a background command running past its turn and delivers its follow-up as a continuation",
+    "completes a background command's card when it ends and streams the model's follow-up into one run",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness(singleCommand);
-        const {
-          session,
-          startTurn,
-          collectTurn,
-          fileSystem,
-          transcriptPath,
-          offers,
-          continuationRequests,
-          transcriptRead,
-        } = h;
+        const { session, startTurn, collectTurn, fileSystem, transcriptPath, offers } = h;
         yield* startTurn(1, {
           createdBy: "user",
           creationSource: "web",
@@ -965,74 +962,189 @@ describe("AntigravityAdapterV2 background work", () => {
         assert.isTrue(yield* session.hasPendingBackgroundWork!);
         assert.isDefined(h.eventsFile());
 
-        // agy's model is still answering when the Stop hook lands: the transcript has the wake
-        // message but not yet the follow-up, as in the live run where the first run closed early.
-        const beforeAnswer = [
-          { step_index: 4, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
-          {
-            step_index: 5,
-            type: "SYSTEM_MESSAGE",
-            status: "DONE",
-            content: `<SYSTEM_MESSAGE>\n[Message] timestamp=t sender=${SESSION}/task-2 priority=HIGH content=Task id "${SESSION}/task-2" finished with result:\nCommand exited with code 0.\n\nCommand output:\nONE\r\n\nLog: file:///x\n</SYSTEM_MESSAGE>`,
-          },
-        ];
-        const answer = {
-          step_index: 6,
-          type: "PLANNER_RESPONSE",
-          status: "DONE",
-          content: "It printed ONE.",
-        };
-        yield* fileSystem.writeFileString(transcriptPath, jsonl(beforeAnswer));
+        // The command ends: agy's model has not said anything yet, but the card must be done.
         const common = { transcriptPath };
+        yield* fileSystem.writeFileString(h.taskLogPath(2), "ONE\r\n");
+        yield* fileSystem.writeFileString(
+          transcriptPath,
+          jsonl([{ step_index: 4, type: "PLANNER_RESPONSE", status: "DONE", content: "started" }]),
+        );
         yield* fileSystem.writeFileString(
           h.eventsFile()!,
           hookLine("Stop", { ...common, fullyIdle: false }) +
             hookLine("PostToolUse", {
               ...common,
               stepIdx: 2,
-              toolCall: { name: "run_command", args: COMMAND },
+              toolCall: { name: "run_command", args: COMMAND, id: "call_1" },
               error: "",
-            }) +
-            hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 5 }) +
-            hookLine("Stop", { ...common, fullyIdle: true }),
+            }),
         );
-        yield* Deferred.await(transcriptRead);
-        // The card is held with its follow-up, so no run starts before the model has answered.
-        assert.lengthOf(continuationRequests, 0);
-        yield* fileSystem.writeFileString(transcriptPath, jsonl([...beforeAnswer, answer]));
         yield* Queue.take(offers);
+        yield* startTurn(2, providerContinuation);
+        const woken = yield* Effect.forkScoped(collectTurn);
 
-        yield* startTurn(2, {
-          createdBy: "agent",
-          creationSource: "provider",
-          text: "Background task completed.",
-        });
-        const continuation = yield* collectTurn;
-        const items = continuation.flatMap((event) =>
-          event.type === "turn_item.updated" ? [event.turnItem] : [],
+        const wakeSteps = [
+          { step_index: 4, type: "PLANNER_RESPONSE", status: "DONE", content: "started" },
+          wakeMessage(5, 2, "ONE"),
+          answerStep(6, "It printed ONE."),
+        ];
+        yield* fileSystem.writeFileString(transcriptPath, jsonl(wakeSteps));
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 5 }) +
+            hookLine("Stop", { ...common, fullyIdle: true }),
+          { flag: "a" },
         );
+        const continuation = yield* Fiber.join(woken);
+        const items = itemsOf(continuation);
         const command = items.findLast((item) => item.type === "command_execution");
         assert.equal(command?.type === "command_execution" && command.status, "completed");
         assert.equal(command?.type === "command_execution" && command.output, "ONE");
-        const reply = items.findLast((item) => item.type === "assistant_message");
-        assert.equal(reply?.type === "assistant_message" && reply.text, "It printed ONE.");
-        assert.lengthOf(continuationRequests, 1);
+        assert.deepEqual(repliesOf(items), ["It printed ONE."]);
+        assert.lengthOf(h.continuationRequests, 1);
         assert.isFalse(yield* session.hasPendingBackgroundWork!);
 
         // The next prompt makes agy stream the wake again; none of it may show up in that turn.
         yield* startTurn(3, { createdBy: "user", creationSource: "web", text: "anything else?" });
-        const next = (yield* collectTurn).flatMap((event) =>
-          event.type === "turn_item.updated" ? [event.turnItem] : [],
-        );
+        const next = itemsOf(yield* collectTurn);
         assert.isUndefined(next.find((item) => item.type === "command_execution"));
-        assert.deepEqual(
-          [
-            ...new Set(
-              next.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
-            ),
-          ],
-          ["Nothing else."],
+        assert.deepEqual(repliesOf(next), ["Nothing else."]);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  const THIRD = { CommandLine: "sleep 9", IsDaemon: false, WaitMsBeforeAsync: 500 };
+  const replayThird: PromptFrames = (prompt, send) =>
+    prompt === 0
+      ? send({ sessionUpdate: "tool_call", ...commandFrame, status: "in_progress" }).pipe(
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "started" },
+            }),
+          ),
+        )
+      : // agy replays the wake under the tool call ids it gave the commands.
+        send({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_three",
+          name: "run_command",
+          title: THIRD.CommandLine,
+          kind: "execute",
+          rawInput: THIRD,
+          status: "in_progress",
+        }).pipe(
+          Effect.andThen(
+            send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Waiting for it." },
+            }),
+          ),
         );
+
+  it.live(
+    "streams a command the wake starts when it begins, leaves it running, and does not replay it",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness(replayThird);
+        const { session, startTurn, collectTurn, fileSystem, transcriptPath, offers } = h;
+        yield* startTurn(1, { createdBy: "user", creationSource: "web", text: "run a command" });
+        yield* collectTurn;
+        const common = { transcriptPath };
+        yield* fileSystem.writeFileString(h.taskLogPath(2), "ONE\r\n");
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("Stop", { ...common, fullyIdle: false }) +
+            hookLine("PostToolUse", {
+              ...common,
+              stepIdx: 2,
+              toolCall: { name: "run_command", args: COMMAND, id: "call_1" },
+              error: "",
+            }),
+        );
+        yield* Queue.take(offers);
+        yield* startTurn(2, providerContinuation);
+        const wakeEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runForEach((event) => Queue.offer(wakeEvents, event)),
+          Effect.forkScoped,
+        );
+        const taken: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        const until = (done: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
+          Effect.gen(function* () {
+            while (true) {
+              const event = yield* Queue.take(wakeEvents);
+              taken.push(event);
+              if (done(event)) return;
+            }
+          });
+
+        // The model answers the wake with a text and a tool call; the tool begins.
+        const decided = {
+          step_index: 6,
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "ONE is done. Starting the next one.",
+          tool_calls: [{ name: "run_command", args: THIRD }],
+        };
+        const wakeSteps = [wakeMessage(5, 2, "ONE"), decided];
+        yield* fileSystem.writeFileString(transcriptPath, jsonl(wakeSteps));
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 5 }) +
+            hookLine("PreToolUse", {
+              ...common,
+              stepIdx: 7,
+              toolCall: { name: "run_command", args: THIRD, id: "call_three" },
+            }),
+          { flag: "a" },
+        );
+        yield* until(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "call_three",
+        );
+        // It went to the background and the model closed the wake.
+        yield* fileSystem.writeFileString(
+          transcriptPath,
+          jsonl([
+            ...wakeSteps,
+            {
+              step_index: 7,
+              type: "GENERIC",
+              status: "RUNNING",
+              content: `task id: ${SESSION}/task-7`,
+            },
+            answerStep(8, "Waiting for it."),
+          ]),
+        );
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("PreInvocation", { ...common, invocationNum: 1, initialNumSteps: 8 }) +
+            hookLine("Stop", { ...common, fullyIdle: false }),
+          { flag: "a" },
+        );
+        yield* until((event) => event.type === "turn.terminal");
+        const items = itemsOf(taken);
+        const first = items.findLast(
+          (item) => item.type === "command_execution" && item.nativeItemRef?.nativeId === "call_1",
+        );
+        assert.equal(first?.type === "command_execution" && first.output, "ONE");
+        const third = items.findLast(
+          (item) =>
+            item.type === "command_execution" && item.nativeItemRef?.nativeId === "call_three",
+        );
+        assert.equal(third?.status, "running");
+        assert.deepEqual(repliesOf(items), [
+          "ONE is done. Starting the next one.",
+          "Waiting for it.",
+        ]);
+        assert.isTrue(yield* session.hasPendingBackgroundWork!);
+
+        yield* startTurn(3, { createdBy: "user", creationSource: "web", text: "anything else?" });
+        const next = itemsOf(yield* collectTurn);
+        assert.isUndefined(next.find((item) => item.type === "command_execution"));
+        assert.deepEqual(repliesOf(next), []);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 
@@ -1092,15 +1204,26 @@ describe("AntigravityAdapterV2 background work", () => {
         const h = yield* makeHarness(schedule);
         const { session, startTurn, collectTurn, fileSystem, transcriptPath, offers } = h;
         yield* startTurn(1, { createdBy: "user", creationSource: "web", text: "/schedule in 20s" });
-        const first = (yield* collectTurn).flatMap((event) =>
-          event.type === "turn_item.updated" ? [event.turnItem] : [],
-        );
+        const first = itemsOf(yield* collectTurn);
         const timerOf = (items: typeof first) =>
           items.findLast((item) => item.type === "dynamic_tool");
         assert.equal(timerOf(first)?.status, "running");
         assert.isTrue(yield* session.hasPendingBackgroundWork!);
 
         const common = { transcriptPath };
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("Stop", { ...common, fullyIdle: false }) +
+            hookLine("PostToolUse", {
+              ...common,
+              stepIdx: 2,
+              toolCall: { name: "schedule", args: SCHEDULE },
+              error: "",
+            }),
+        );
+        yield* Queue.take(offers);
+        yield* startTurn(2, providerContinuation);
+        const woken = yield* Effect.forkScoped(collectTurn);
         yield* fileSystem.writeFileString(
           transcriptPath,
           jsonl([
@@ -1115,34 +1238,13 @@ describe("AntigravityAdapterV2 background work", () => {
         );
         yield* fileSystem.writeFileString(
           h.eventsFile()!,
-          hookLine("Stop", { ...common, fullyIdle: false }) +
-            hookLine("PostToolUse", {
-              ...common,
-              stepIdx: 2,
-              toolCall: { name: "schedule", args: SCHEDULE },
-              error: "",
-            }) +
-            hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
+          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
             hookLine("Stop", { ...common, fullyIdle: true }),
+          { flag: "a" },
         );
-        yield* Queue.take(offers);
-        yield* startTurn(2, {
-          createdBy: "agent",
-          creationSource: "provider",
-          text: "Background task completed.",
-        });
-        const woken = (yield* collectTurn).flatMap((event) =>
-          event.type === "turn_item.updated" ? [event.turnItem] : [],
-        );
-        assert.equal(timerOf(woken)?.status, "completed");
-        assert.deepEqual(
-          [
-            ...new Set(
-              woken.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
-            ),
-          ],
-          ["PING"],
-        );
+        const wokenItems = itemsOf(yield* Fiber.join(woken));
+        assert.equal(timerOf(wokenItems)?.status, "completed");
+        assert.deepEqual(repliesOf(wokenItems), ["PING"]);
         assert.isFalse(yield* session.hasPendingBackgroundWork!);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
@@ -1155,14 +1257,9 @@ describe("AntigravityAdapterV2 background work", () => {
       yield* collectTurn;
       assert.isDefined(h.eventsFile());
       const common = { transcriptPath };
-      const itemsOf = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
-        events.flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
 
       // The first wake stops while the second command is still running.
-      yield* fileSystem.writeFileString(
-        transcriptPath,
-        jsonl([wakeMessage(4, 2, "ONE"), answerStep(5, "ONE finished.")]),
-      );
+      yield* fileSystem.writeFileString(h.taskLogPath(2), "ONE\r\n");
       yield* fileSystem.writeFileString(
         h.eventsFile()!,
         hookLine("Stop", { ...common, fullyIdle: false }) +
@@ -1171,29 +1268,41 @@ describe("AntigravityAdapterV2 background work", () => {
             stepIdx: 2,
             toolCall: { name: "run_command", args: COMMAND },
             error: "",
-          }) +
-          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
-          hookLine("Stop", { ...common, fullyIdle: false }),
+          }),
       );
       yield* Queue.take(offers);
-      yield* startTurn(2, {
-        createdBy: "agent",
-        creationSource: "provider",
-        text: "Background task completed.",
-      });
-      const first = itemsOf(yield* collectTurn);
+      yield* startTurn(2, providerContinuation);
+      const firstRun = yield* Effect.forkScoped(collectTurn);
+      yield* fileSystem.writeFileString(
+        transcriptPath,
+        jsonl([wakeMessage(4, 2, "ONE"), answerStep(5, "ONE finished.")]),
+      );
+      yield* fileSystem.writeFileString(
+        h.eventsFile()!,
+        hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
+          hookLine("Stop", { ...common, fullyIdle: false }),
+        { flag: "a" },
+      );
+      const first = itemsOf(yield* Fiber.join(firstRun));
       const firstCard = first.findLast((item) => item.type === "command_execution");
       assert.equal(firstCard?.type === "command_execution" && firstCard.output, "ONE");
-      assert.deepEqual(
-        [
-          ...new Set(
-            first.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
-          ),
-        ],
-        ["ONE finished."],
-      );
+      assert.deepEqual(repliesOf(first), ["ONE finished."]);
       assert.isTrue(yield* session.hasPendingBackgroundWork!);
 
+      yield* fileSystem.writeFileString(h.taskLogPath(3), "TWO\r\n");
+      yield* fileSystem.writeFileString(
+        h.eventsFile()!,
+        hookLine("PostToolUse", {
+          ...common,
+          stepIdx: 3,
+          toolCall: { name: "run_command", args: SECOND },
+          error: "",
+        }),
+        { flag: "a" },
+      );
+      yield* Queue.take(offers);
+      yield* startTurn(3, providerContinuation);
+      const secondRun = yield* Effect.forkScoped(collectTurn);
       yield* fileSystem.writeFileString(
         transcriptPath,
         jsonl([
@@ -1205,33 +1314,14 @@ describe("AntigravityAdapterV2 background work", () => {
       );
       yield* fileSystem.writeFileString(
         h.eventsFile()!,
-        hookLine("PostToolUse", {
-          ...common,
-          stepIdx: 3,
-          toolCall: { name: "run_command", args: SECOND },
-          error: "",
-        }) +
-          hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 6 }) +
+        hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 6 }) +
           hookLine("Stop", { ...common, fullyIdle: true }),
         { flag: "a" },
       );
-      yield* Queue.take(offers);
-      yield* startTurn(3, {
-        createdBy: "agent",
-        creationSource: "provider",
-        text: "Background task completed.",
-      });
-      const second = itemsOf(yield* collectTurn);
+      const second = itemsOf(yield* Fiber.join(secondRun));
       const secondCard = second.findLast((item) => item.type === "command_execution");
       assert.equal(secondCard?.type === "command_execution" && secondCard.output, "TWO");
-      assert.deepEqual(
-        [
-          ...new Set(
-            second.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
-          ),
-        ],
-        ["TWO finished."],
-      );
+      assert.deepEqual(repliesOf(second), ["TWO finished."]);
       assert.isFalse(yield* session.hasPendingBackgroundWork!);
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );

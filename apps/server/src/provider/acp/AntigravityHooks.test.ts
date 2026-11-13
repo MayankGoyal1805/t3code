@@ -31,6 +31,7 @@ describe("mergeAntigravityHooksConfig", () => {
     assert.equal(config.extra, 1);
     assert.deepEqual(Object.keys(config[ANTIGRAVITY_HOOK_NAME]), [
       "PreInvocation",
+      "PreToolUse",
       "PostToolUse",
       "Stop",
     ]);

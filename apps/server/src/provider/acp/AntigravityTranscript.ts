@@ -10,12 +10,19 @@ const TranscriptStep = Schema.Struct({
   status: Schema.optional(Schema.String),
   content: Schema.optional(Schema.String),
   tool_calls: Schema.optional(
-    Schema.Array(Schema.Struct({ name: Schema.String, args: Schema.optional(Schema.Unknown) })),
+    Schema.Array(
+      Schema.Struct({
+        name: Schema.String,
+        args: Schema.optional(Schema.Unknown),
+        id: Schema.optional(Schema.NullOr(Schema.String)),
+      }),
+    ),
   ),
 });
 
 export type AntigravityTranscriptStep = typeof TranscriptStep.Type;
 
+const LINE_INDEX = /^\{"step_index":(\d+)/;
 const decodeStep = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptStep));
 
 /** Steps whose index is at least `from`, in order. A partial first or last line is skipped. */
@@ -28,6 +35,9 @@ export function parseAntigravityTranscript(
   const lines = text.split("\n");
   if (options?.truncatedStart === true) lines.shift();
   return lines.flatMap((line) => {
+    // Each line opens with its index, so older steps are skipped without decoding them.
+    const index = LINE_INDEX.exec(line);
+    if (index !== null && Number(index[1]) < from) return [];
     const step = decodeStep(line);
     return Option.isSome(step) && step.value.step_index >= from ? [step.value] : [];
   });

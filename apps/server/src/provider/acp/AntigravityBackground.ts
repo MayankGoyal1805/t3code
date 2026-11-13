@@ -24,8 +24,17 @@ type SessionUpdate = EffectAcpSchema.SessionUpdate;
 
 export interface AntigravityBackgroundStep {
   readonly updates: ReadonlyArray<SessionUpdate>;
-  /** Steps the caller should read from this transcript and pass to `transcript`. */
-  readonly read?: { readonly transcriptPath: string };
+  /** Files the caller should read now and pass to `ingest`. */
+  readonly read?: {
+    readonly transcriptPath: string;
+    /** Where a finished command's output is already written, before the transcript has it. */
+    readonly taskLog?: { readonly toolCallId: string; readonly path: string };
+  };
+}
+
+export interface AntigravityIngest {
+  readonly steps: ReadonlyArray<AntigravityTranscriptStep>;
+  readonly taskLog?: { readonly toolCallId: string; readonly text: string };
 }
 
 export interface AntigravityToolObservation {
@@ -36,23 +45,45 @@ export interface AntigravityToolObservation {
 }
 
 interface TrackedTool {
-  readonly toolCallId: string;
+  toolCallId: string;
   readonly name: string;
   readonly args: unknown;
   readonly title: string;
   readonly kind: "execute" | "other";
+  synthetic: boolean;
   background: boolean;
   done: boolean;
   stepIdx: number | undefined;
-  /** The completion carried no output yet; a later transcript read can supply it. */
-  needsOutput: boolean;
-  failed: boolean;
+  /** False for a call the transcript names before its PreToolUse hook says it began. */
+  started: boolean;
+  /** What the last completion update carried; a later transcript can correct it. */
+  delivered:
+    | {
+        readonly exitCode: number | undefined;
+        readonly output: string | undefined;
+        fromMessage: boolean;
+      }
+    | undefined;
 }
 
+/** One stretch of agy working on its own: from a finished task to the `Stop` that ends it. */
 interface Wake {
-  readonly from: number;
+  /** The first transcript step of the wake; known once its PreInvocation arrives. */
+  from: number | undefined;
   stopped: boolean;
-  fullyIdle: boolean;
+  cursor: number;
+  /** Calls the transcript named, in order, awaiting their result steps. */
+  open: TrackedTool[];
+  /** PreToolUse hooks not yet matched to a call the transcript named. */
+  starts: Array<{ readonly name: string; readonly args: unknown; readonly id?: string | null }>;
+  /** agy's reply has been seen; whatever follows it in the transcript belongs to a later wake. */
+  ended: boolean;
+}
+
+interface ShownCall {
+  readonly name: string;
+  readonly args: unknown;
+  matched: boolean;
 }
 
 const canonical = (value: unknown): string =>
@@ -100,19 +131,33 @@ export function parseAntigravityTaskMessage(content: string | undefined) {
   };
 }
 
+const taskLogPath = (transcriptPath: string, stepIdx: number) => {
+  const logs = /^(.*)[\\/]logs[\\/][^\\/]+$/.exec(transcriptPath);
+  return logs === null ? undefined : `${logs[1]}/tasks/task-${stepIdx}.log`;
+};
+
+const squash = (text: string) => text.replace(/\s+/g, "");
+
 export function makeAntigravityBackgroundFollower() {
   let sessionId: string | undefined;
   let promptInFlight = false;
   let busyStopDuringPrompt = false;
-  let pendingWakes = 0;
   let wake: Wake | undefined;
-  let cursor = -1;
-  /** Finished while no prompt ran: reported with the wake's follow-up so one run carries both. */
-  /** Tool calls and texts already delivered by a wake; agy streams them again at the next prompt. */
-  const reported = new Set<string>();
-  let replayableTexts: string[] = [];
-  let held: Array<{ readonly tool: TrackedTool; readonly error: string | null | undefined }> = [];
   let transcriptPath: string | undefined;
+  /** Tool calls delivered by a wake; agy streams them again at the next prompt. */
+  const reported = new Set<string>();
+  /** Calls shown under an id of ours, which the replay names with agy's own. */
+  let shownCalls: ShownCall[] = [];
+  const replayedIds = new Set<string>();
+  let shownTexts: string[] = [];
+  let replayMatch: string | undefined;
+  /** The replay comes first at a prompt; anything else it streams is the prompt's own. */
+  let replayOpen = false;
+  let pendingCompletions: Array<{
+    readonly tool: TrackedTool;
+    readonly error: string | null | undefined;
+  }> = [];
+  const taskOutputs = new Map<string, string>();
   const tools = new Map<string, TrackedTool>();
   const knownMessages = new Map<
     number,
@@ -147,10 +192,12 @@ export function makeAntigravityBackgroundFollower() {
     const failed =
       (error !== undefined && error !== null && error.length > 0) || (exitCode ?? 0) !== 0;
     if (tool.name === "run_command") {
-      const output = message?.output ?? (error ? error : undefined);
+      const output =
+        message?.output ?? taskOutputs.get(tool.toolCallId) ?? (error ? error : undefined);
       return {
         failed,
-        known: message !== undefined,
+        message,
+        output,
         rawOutput:
           output === undefined && exitCode === undefined
             ? undefined
@@ -160,13 +207,17 @@ export function makeAntigravityBackgroundFollower() {
               },
       };
     }
-    return { failed, known: true, rawOutput: failed && error ? error : "Timer elapsed." };
+    return {
+      failed,
+      message,
+      output: undefined,
+      rawOutput: failed && error ? error : "Timer elapsed.",
+    };
   };
 
   const complete = (tool: TrackedTool, error: string | null | undefined): SessionUpdate => {
-    const { failed, known, rawOutput } = outputFor(tool, error);
-    tool.needsOutput = !known;
-    tool.failed = failed;
+    const { failed, message, output, rawOutput } = outputFor(tool, error);
+    tool.delivered = { exitCode: message?.exitCode, output, fromMessage: message !== undefined };
     reported.add(tool.toolCallId);
     return toolUpdate(
       tool,
@@ -176,12 +227,6 @@ export function makeAntigravityBackgroundFollower() {
       },
       "tool_call_update",
     );
-  };
-
-  const flushHeld = (): SessionUpdate[] => {
-    const finished = held;
-    held = [];
-    return finished.map(({ tool, error }) => complete(tool, error));
   };
 
   const confirmBackground = () => {
@@ -195,85 +240,208 @@ export function makeAntigravityBackgroundFollower() {
     readonly name: string;
     readonly args: unknown;
     readonly background: boolean;
-    readonly stepIdx?: number;
-    readonly title?: string;
+    readonly started: boolean;
+    readonly synthetic?: boolean;
   }) => {
     const description = toolDescription(input.name, input.args);
-    tools.set(input.toolCallId, {
+    const tool: TrackedTool = {
       toolCallId: input.toolCallId,
       name: input.name,
       args: input.args,
-      title: input.title ?? description.title,
+      title: description.title,
       kind: description.kind,
       background: input.background,
       done: false,
-      stepIdx: input.stepIdx,
-      needsOutput: false,
-      failed: false,
-    });
+      stepIdx: undefined,
+      started: input.started,
+      synthetic: input.synthetic === true,
+      delivered: undefined,
+    };
+    tools.set(input.toolCallId, tool);
+    return tool;
   };
 
-  /** Updates for outputs a transcript now knows for tasks completed without them. */
-  const fillOutputs = (): SessionUpdate[] => {
+  const startTool = (tool: TrackedTool): SessionUpdate[] => {
+    if (tool.started) return [];
+    tool.started = true;
+    reported.add(tool.toolCallId);
+    if (tool.synthetic) shownCalls.push({ name: tool.name, args: tool.args, matched: false });
+    return [toolUpdate(tool, { status: "in_progress" }, "tool_call")];
+  };
+
+  const newWake = (): Wake => ({
+    from: undefined,
+    stopped: false,
+    cursor: -1,
+    open: [],
+    starts: [],
+    ended: false,
+  });
+
+  /** Ends the wake: calls still without a result step have nothing more to report. */
+  const closeWake = (): SessionUpdate[] => {
+    const updates: SessionUpdate[] = [];
+    const current = wake;
+    wake = undefined;
+    const completions = pendingCompletions;
+    pendingCompletions = [];
+    for (const { tool, error } of completions) updates.push(complete(tool, error));
+    if (current === undefined) return updates;
+    for (const tool of current.open) {
+      updates.push(...startTool(tool));
+      tool.done = true;
+      updates.push(toolUpdate(tool, { status: "completed" }, "tool_call_update"));
+    }
+    return updates;
+  };
+
+  /** A later transcript read can know more than the completion that was already sent. */
+  const corrections = (): SessionUpdate[] => {
     const updates: SessionUpdate[] = [];
     for (const tool of tools.values()) {
-      if (!tool.done || !tool.needsOutput || tool.stepIdx === undefined) continue;
-      if (!knownMessages.has(tool.stepIdx)) continue;
+      if (!tool.done || tool.delivered === undefined || tool.delivered.fromMessage) continue;
+      const message = tool.stepIdx === undefined ? undefined : knownMessages.get(tool.stepIdx);
+      if (message === undefined) continue;
+      if (
+        (message.exitCode ?? 0) === (tool.delivered.exitCode ?? 0) &&
+        (message.output === undefined || message.output === tool.delivered.output)
+      ) {
+        tool.delivered.fromMessage = true;
+        continue;
+      }
       updates.push(complete(tool, undefined));
     }
     return updates;
   };
 
-  const followUp = (steps: ReadonlyArray<AntigravityTranscriptStep>, from: number) => {
+  const takeStart = (name: string, args: unknown) => {
+    if (wake === undefined) return undefined;
+    const canonicalArgs = canonical(args ?? null);
+    const index = wake.starts.findIndex(
+      (start) => start.name === name && canonical(start.args ?? null) === canonicalArgs,
+    );
+    if (index < 0) return undefined;
+    const [start] = wake.starts.splice(index, 1);
+    return { id: start?.id ?? undefined };
+  };
+
+  const announce = (
+    step: AntigravityTranscriptStep,
+    call: NonNullable<AntigravityTranscriptStep["tool_calls"]>[number],
+    index: number,
+  ): SessionUpdate[] => {
+    const begun = takeStart(call.name, call.args);
+    const realId = begun?.id ?? call.id ?? undefined;
+    const tool = track({
+      toolCallId: realId ?? `agy-${sessionId ?? "session"}-${step.step_index}-${index}`,
+      name: call.name,
+      args: call.args,
+      background: false,
+      started: false,
+      synthetic: realId === undefined,
+    });
+    wake!.open.push(tool);
+    // The hook says the tool begins now; without it the call starts when its result arrives.
+    return begun === undefined && call.id == null ? [] : startTool(tool);
+  };
+
+  const flushStarts = (): SessionUpdate[] => {
     const updates: SessionUpdate[] = [];
-    const calls: TrackedTool[] = [];
-    for (const step of steps) {
-      if (step.step_index < from || step.step_index <= cursor) continue;
+    if (wake === undefined) return updates;
+    for (const tool of wake.open) {
+      if (tool.started) continue;
+      const begun = takeStart(tool.name, tool.args);
+      if (begun === undefined) continue;
+      // The hook can name the call after the transcript did, as long as nothing was shown yet.
+      if (begun.id !== undefined) {
+        tools.delete(tool.toolCallId);
+        tool.toolCallId = begun.id;
+        tool.synthetic = false;
+        tools.set(tool.toolCallId, tool);
+      }
+      updates.push(...startTool(tool));
+    }
+    return updates;
+  };
+
+  const stream = (steps: ReadonlyArray<AntigravityTranscriptStep>): SessionUpdate[] => {
+    const current = wake;
+    if (current === undefined || current.from === undefined || current.ended) return [];
+    const updates: SessionUpdate[] = [];
+    const pending = steps
+      .filter((step) => step.step_index >= current.from! && step.step_index > current.cursor)
+      .toSorted((a, b) => a.step_index - b.step_index);
+    const emitText = (raw: string | undefined) => {
+      const text = stripAntigravityGoalMarker(raw ?? "");
+      if (text.trim().length === 0) return;
+      shownTexts.push(squash(text));
+      updates.push({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+        ...tag(),
+      } as SessionUpdate);
+    };
+    for (const [position, step] of pending.entries()) {
       if (step.type === "PLANNER_RESPONSE") {
-        const text = stripAntigravityGoalMarker(step.content ?? "");
-        if (text.trim().length > 0) {
-          replayableTexts.push(text);
-          updates.push({
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text },
-            ...tag(),
-          } as SessionUpdate);
-        }
-        for (const [index, call] of (step.tool_calls ?? []).entries()) {
-          const id = `agy-${sessionId ?? "session"}-${step.step_index}-${index}`;
-          track({ toolCallId: id, name: call.name, args: call.args, background: false });
-          const tool = tools.get(id)!;
-          calls.push(tool);
-          updates.push(toolUpdate(tool, { status: "in_progress" }, "tool_call"));
+        const calls = step.tool_calls ?? [];
+        if (calls.length === 0) {
+          const next = pending[position + 1];
+          // The last text may still be a reply agy rejects, so it waits for what follows it.
+          if (next === undefined && !current.stopped) break;
+          if (next?.type !== "ERROR_MESSAGE") {
+            emitText(step.content);
+            current.cursor = step.step_index;
+            current.ended = true;
+            break;
+          }
+        } else {
+          emitText(step.content);
+          for (const [index, call] of calls.entries()) updates.push(...announce(step, call, index));
         }
       } else if (step.type === "GENERIC") {
-        const tool = calls.shift();
-        if (tool === undefined) continue;
-        if (step.status === "RUNNING" && isAntigravityBackgroundToolName(tool.name)) {
-          tool.background = true;
-          tool.stepIdx = step.step_index;
-          continue;
+        const tool = current.open.shift();
+        if (tool !== undefined) {
+          updates.push(...startTool(tool));
+          if (step.status === "RUNNING" && isAntigravityBackgroundToolName(tool.name)) {
+            tool.background = true;
+            tool.stepIdx = step.step_index;
+          } else {
+            tool.done = true;
+            updates.push(
+              toolUpdate(
+                tool,
+                {
+                  status: "completed",
+                  ...(step.content === undefined ? {} : { rawOutput: step.content }),
+                },
+                "tool_call_update",
+              ),
+            );
+          }
         }
-        tool.done = true;
-        updates.push(
-          toolUpdate(
-            tool,
-            {
-              status: "completed",
-              ...(step.content === undefined ? {} : { rawOutput: step.content }),
-            },
-            "tool_call_update",
-          ),
-        );
       }
+      current.cursor = step.step_index;
     }
-    // Tools whose result step is missing have nothing more to report; none may spin forever.
-    for (const tool of calls) {
-      tool.done = true;
-      updates.push(toolUpdate(tool, { status: "completed" }, "tool_call_update"));
-    }
-    for (const step of steps) cursor = Math.max(cursor, step.step_index);
+    updates.push(...flushStarts());
     return updates;
+  };
+
+  const replayedCall = (update: SessionUpdate & { readonly toolCallId: string }) => {
+    const fields = update as { readonly name?: unknown; readonly rawInput?: unknown };
+    if (fields.rawInput === undefined) return false;
+    const args = canonical(fields.rawInput);
+    const command = asRecord(fields.rawInput).CommandLine;
+    const shown = shownCalls.find(
+      (call) =>
+        !call.matched &&
+        (fields.name === undefined || fields.name === call.name) &&
+        (canonical(call.args ?? null) === args ||
+          (typeof command === "string" && asRecord(call.args).CommandLine === command)),
+    );
+    if (shown === undefined) return false;
+    shown.matched = true;
+    replayedIds.add(update.toolCallId);
+    return true;
   };
 
   return {
@@ -281,11 +449,14 @@ export function makeAntigravityBackgroundFollower() {
       sessionId = id;
       tools.clear();
       wake = undefined;
-      pendingWakes = 0;
-      cursor = -1;
-      held = [];
+      pendingCompletions = [];
       reported.clear();
-      replayableTexts = [];
+      replayedIds.clear();
+      shownCalls = [];
+      shownTexts = [];
+      replayMatch = undefined;
+      replayOpen = false;
+      taskOutputs.clear();
       knownMessages.clear();
     },
 
@@ -303,6 +474,7 @@ export function makeAntigravityBackgroundFollower() {
           name: input.name,
           args: input.rawInput,
           background: false,
+          started: true,
         });
       }
     },
@@ -311,35 +483,44 @@ export function makeAntigravityBackgroundFollower() {
       promptInFlight = true;
       busyStopDuringPrompt = false;
       wake = undefined;
-      pendingWakes = 0;
+      replayMatch = undefined;
+      replayOpen = shownTexts.length > 0 || shownCalls.some((call) => !call.matched);
     },
 
-    /** agy's own re-stream of a wake already delivered: its tool calls by id, its text in order. */
+    /** agy's own re-stream of a wake already delivered: its tool calls by id or command, its text in order. */
     isReplay(update: SessionUpdate): boolean {
-      if (
-        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-        reported.has(update.toolCallId)
-      ) {
-        return true;
+      if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+        if (reported.has(update.toolCallId) || replayedIds.has(update.toolCallId)) return true;
+        return promptInFlight && replayOpen && replayedCall(update);
       }
       if (update.sessionUpdate !== "agent_message_chunk" || update.content.type !== "text") {
         return false;
       }
-      const expected = replayableTexts[0];
-      const chunk = update.content.text;
-      if (expected === undefined || !promptInFlight) return false;
-      if (chunk.length > 0 && expected.startsWith(chunk)) {
-        const rest = expected.slice(chunk.length);
-        if (rest.length === 0) replayableTexts.shift();
-        else replayableTexts[0] = rest;
+      if (!promptInFlight || !replayOpen) return false;
+      const chunk = squash(update.content.text);
+      if (chunk.length === 0) return replayMatch !== undefined;
+      if (replayMatch !== undefined && replayMatch.startsWith(chunk)) {
+        replayMatch = replayMatch.slice(chunk.length);
+        if (replayMatch.length === 0) replayMatch = undefined;
         return true;
       }
-      replayableTexts = [];
+      const index = shownTexts.findIndex((text) => text.startsWith(chunk));
+      if (index >= 0) {
+        const [text] = shownTexts.splice(index, 1);
+        const rest = text!.slice(chunk.length);
+        replayMatch = rest.length === 0 ? undefined : rest;
+        return true;
+      }
+      replayOpen = false;
+      replayMatch = undefined;
       return false;
     },
 
     promptReturned() {
-      replayableTexts = [];
+      shownTexts = [];
+      shownCalls = [];
+      replayMatch = undefined;
+      replayOpen = false;
       promptInFlight = false;
       if (busyStopDuringPrompt) confirmBackground();
       busyStopDuringPrompt = false;
@@ -351,8 +532,7 @@ export function makeAntigravityBackgroundFollower() {
       promptInFlight = false;
       busyStopDuringPrompt = false;
       wake = undefined;
-      pendingWakes = 0;
-      held = [];
+      pendingCompletions = [];
       tools.clear();
       return updates;
     },
@@ -387,14 +567,31 @@ export function makeAntigravityBackgroundFollower() {
       return updates;
     },
 
-    /** Completions still waiting for a wake that has not finished. */
-    holding(): boolean {
-      return held.length > 0;
+    /** The first transcript step a read for the current hook needs. */
+    readFrom(): number {
+      const wanted = [
+        wake?.from,
+        ...pendingCompletions.map(({ tool }) => tool.stepIdx),
+        ...[...tools.values()].map((tool) =>
+          tool.delivered?.fromMessage === false ? tool.stepIdx : undefined,
+        ),
+      ].filter((index) => index !== undefined);
+      return wanted.length === 0 ? 0 : Math.min(...wanted);
     },
 
-    /** Reports held completions without a follow-up, when the wake never finishes. */
-    flush(): ReadonlyArray<SessionUpdate> {
-      return flushHeld();
+    /** agy is still working on a wake T3 Code is showing, so its run must stay open. */
+    wakeInProgress(): boolean {
+      return wake !== undefined && !promptInFlight;
+    },
+
+    /** The wake has stopped but the follow-up's last step is not in the transcript yet. */
+    awaitingFinal(): boolean {
+      return wake !== undefined && wake.stopped;
+    },
+
+    /** Gives up on a wake that will not finish: nothing may hold its run open for ever. */
+    endWake(): ReadonlyArray<SessionUpdate> {
+      return closeWake();
     },
 
     pendingToolCallIds(): ReadonlyArray<string> {
@@ -406,41 +603,75 @@ export function makeAntigravityBackgroundFollower() {
     hook(event: AntigravityHookEvent): AntigravityBackgroundStep {
       if (sessionId === undefined || event.conversationId !== sessionId) return { updates: [] };
       if (event.transcriptPath !== undefined) transcriptPath = event.transcriptPath;
-      const read = transcriptPath === undefined ? {} : { read: { transcriptPath } };
+      const read = transcriptPath === undefined ? undefined : { transcriptPath };
+      const inWake = wake !== undefined && !promptInFlight;
       switch (event.name) {
         case "PostToolUse": {
-          if (event.toolCall === undefined) return { updates: [] };
-          const args = canonical(event.toolCall.args ?? null);
-          const open = [...tools.values()].filter(
-            (candidate) =>
-              candidate.background && !candidate.done && candidate.name === event.toolCall!.name,
-          );
+          const call = event.toolCall;
+          const open =
+            call === undefined
+              ? []
+              : [...tools.values()].filter(
+                  (candidate) =>
+                    candidate.background && !candidate.done && candidate.name === call.name,
+                );
+          const args = canonical(call?.args ?? null);
           // agy 1.5.x names the tool call in its hook; older runs are matched by their arguments.
           const tool =
-            open.find((candidate) => candidate.toolCallId === event.toolCall!.id) ??
-            open.find((candidate) => canonical(candidate.args ?? null) === args);
-          if (tool === undefined) return { updates: [] };
+            call === undefined
+              ? undefined
+              : (open.find((candidate) => candidate.toolCallId === call.id) ??
+                open.find((candidate) => canonical(candidate.args ?? null) === args));
+          if (tool === undefined)
+            return inWake && read !== undefined ? { updates: [], read } : { updates: [] };
           tool.done = true;
           tool.stepIdx = event.stepIdx;
-          if (promptInFlight) return { updates: [complete(tool, event.error)] };
-          pendingWakes += 1;
-          held.push({ tool, error: event.error });
-          return { updates: [] };
+          pendingCompletions.push({ tool, error: event.error });
+          if (!promptInFlight && wake === undefined) wake = newWake();
+          const path =
+            transcriptPath === undefined || event.stepIdx === undefined
+              ? undefined
+              : taskLogPath(transcriptPath, event.stepIdx);
+          if (read === undefined) return { updates: closeWake() };
+          return {
+            updates: [],
+            read: {
+              ...read,
+              ...(path === undefined ? {} : { taskLog: { toolCallId: tool.toolCallId, path } }),
+            },
+          };
         }
         case "PreInvocation": {
-          if (!promptInFlight && wake === undefined && pendingWakes > 0) {
-            pendingWakes = 0;
-            wake = { from: event.initialNumSteps ?? 0, stopped: false, fullyIdle: false };
+          if (promptInFlight || wake === undefined) return { updates: [] };
+          if (wake.stopped) {
+            // The next wake begins before the last one's follow-up was ever read.
+            const updates = closeWake();
+            wake = newWake();
+            wake.from = event.initialNumSteps ?? 0;
+            return { updates, ...(read === undefined ? {} : { read }) };
           }
-          return { updates: [] };
+          if (wake.from === undefined) wake.from = event.initialNumSteps ?? 0;
+          return read === undefined ? { updates: [] } : { updates: [], read };
+        }
+        case "PreToolUse": {
+          if (!inWake || wake === undefined || event.toolCall === undefined) return { updates: [] };
+          wake.starts.push({
+            name: event.toolCall.name,
+            args: event.toolCall.args,
+            id: event.toolCall.id,
+          });
+          return read === undefined ? { updates: [] } : { updates: [], read };
         }
         case "Stop": {
-          if (wake !== undefined) {
+          if (
+            inWake &&
+            wake !== undefined &&
+            (wake.from !== undefined || event.fullyIdle === true)
+          ) {
+            if (wake.from === undefined) return { updates: closeWake() };
             wake.stopped = true;
-            wake.fullyIdle = event.fullyIdle === true;
-            return { updates: [], ...read };
+            return read === undefined ? { updates: closeWake() } : { updates: [], read };
           }
-          if (event.fullyIdle === true) pendingWakes = 0;
           if (promptInFlight) {
             if (event.fullyIdle === false) busyStopDuringPrompt = true;
           } else if (event.fullyIdle === false) {
@@ -451,39 +682,25 @@ export function makeAntigravityBackgroundFollower() {
       }
     },
 
-    /**
-     * Steps read from the transcript. `incomplete` means a wake has stopped but its follow-up is
-     * not written yet; the next hook or a later read completes it.
-     */
-    transcript(steps: ReadonlyArray<AntigravityTranscriptStep>): {
-      readonly updates: ReadonlyArray<SessionUpdate>;
-      readonly incomplete: boolean;
-    } {
-      for (const step of steps) {
+    /** Everything read for a hook: new transcript steps and, for a finished command, its log. */
+    ingest(input: AntigravityIngest): ReadonlyArray<SessionUpdate> {
+      for (const step of input.steps) {
         if (step.type !== "SYSTEM_MESSAGE") continue;
         const message = parseAntigravityTaskMessage(step.content);
         if (message !== undefined) knownMessages.set(message.stepIdx, message);
       }
-      if (wake === undefined || !wake.stopped) return { updates: fillOutputs(), incomplete: false };
-      const inRange = steps.filter((step) => step.step_index >= wake!.from);
-      const triggered = inRange.findIndex((step) => step.type === "SYSTEM_MESSAGE");
-      // A later wake's message ends this one; its steps belong to its own run.
-      const nextWake =
-        triggered < 0
-          ? -1
-          : inRange.findIndex((step, index) => index > triggered && step.type === "SYSTEM_MESSAGE");
-      const fresh = nextWake < 0 ? inRange : inRange.slice(0, nextWake);
-      const answered = fresh
-        .slice(Math.max(0, triggered))
-        .some((step) => step.type === "PLANNER_RESPONSE");
-      if (!answered) return { updates: [], incomplete: true };
-      const { from, fullyIdle } = wake;
-      wake = undefined;
-      if (fullyIdle) pendingWakes = 0;
-      return {
-        updates: [...flushHeld(), ...fillOutputs(), ...followUp(fresh, from)],
-        incomplete: false,
-      };
+      if (input.taskLog !== undefined) {
+        const text = input.taskLog.text.replaceAll("\r\n", "\n").trimEnd();
+        if (text.length > 0) taskOutputs.set(input.taskLog.toolCallId, text);
+      }
+      const updates: SessionUpdate[] = [];
+      const completions = pendingCompletions;
+      pendingCompletions = [];
+      for (const { tool, error } of completions) updates.push(complete(tool, error));
+      updates.push(...corrections());
+      updates.push(...stream(input.steps));
+      if (wake?.stopped === true && wake.ended) updates.push(...closeWake());
+      return updates;
     },
   };
 }

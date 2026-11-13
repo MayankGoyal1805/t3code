@@ -87,8 +87,42 @@ const hook = (
   ...fields,
 });
 
-const postToolUse = (stepIdx: number, args: unknown, name = "run_command") =>
-  hook("PostToolUse", { stepIdx, toolCall: { name, args }, error: "" });
+const postToolUse = (stepIdx: number, args: unknown, name = "run_command", id?: string) =>
+  hook("PostToolUse", {
+    stepIdx,
+    toolCall: { name, args, ...(id === undefined ? {} : { id }) },
+    error: "",
+  });
+const preToolUse = (stepIdx: number, args: unknown, id?: string) =>
+  hook("PreToolUse", {
+    stepIdx,
+    toolCall: { name: "run_command", args, ...(id === undefined ? {} : { id }) },
+  });
+const preInvocation = (initialNumSteps: number) =>
+  hook("PreInvocation", { invocationNum: 0, initialNumSteps });
+
+type Follower = ReturnType<typeof makeAntigravityBackgroundFollower>;
+
+/** What agy's hook handler and the transcript read after it would deliver, in one call. */
+function feed(
+  follower: Follower,
+  event: AntigravityHookEvent,
+  steps: ReadonlyArray<AntigravityTranscriptStep> = [],
+  taskLog?: string,
+) {
+  const step = follower.hook(event);
+  const log = step.read?.taskLog;
+  const read =
+    step.read === undefined
+      ? []
+      : follower.ingest({
+          steps,
+          ...(log === undefined || taskLog === undefined
+            ? {}
+            : { taskLog: { toolCallId: log.toolCallId, text: taskLog } }),
+        });
+  return [...step.updates, ...read];
+}
 
 function launched(...calls: ReadonlyArray<{ id: string; name?: string; args: unknown }>) {
   const follower = makeAntigravityBackgroundFollower();
@@ -119,62 +153,251 @@ const summarize = (updates: ReadonlyArray<object>) =>
 const isWake = (update: object) =>
   (update as { _meta?: Record<string, unknown> })._meta?.[ANTIGRAVITY_WAKE_META] === true;
 
+const chunk = (value: string) =>
+  ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } }) as const;
+
 describe("AntigravityBackgroundFollower", () => {
-  it("holds a finished task until its wake ends, then delivers card and follow-up together", () => {
+  it("completes the card the moment its command ends, with the output from its task log", () => {
     const follower = launched({ id: "call_1", args: ONE });
     assert.deepEqual(follower.pendingToolCallIds(), ["call_1"]);
 
-    // Nothing is reported while the model is still working on its follow-up.
-    assert.deepEqual(follower.hook(postToolUse(2, ONE)).updates, []);
-    assert.isTrue(follower.holding());
-    assert.deepEqual(follower.pendingToolCallIds(), []);
-    assert.deepEqual(
-      follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 })).updates,
-      [],
-    );
-    const stop = follower.hook(hook("Stop", { fullyIdle: true }));
-    assert.equal(stop.read?.transcriptPath, TRANSCRIPT_PATH);
-
-    const result = follower.transcript(transcript(launchSteps, firstWake));
-    assert.isFalse(result.incomplete);
-    assert.deepEqual(summarize(result.updates), [
-      ["tool_call_update", "call_1", "completed"],
-      ["agent_message_chunk", "The first command has finished.\n\nONE", null],
-    ]);
-    assert.deepEqual((result.updates[0] as { rawOutput?: unknown }).rawOutput, {
-      combinedOutput: "ONE",
-      exitCode: 0,
+    const post = follower.hook(postToolUse(2, ONE, "run_command", "call_1"));
+    assert.deepEqual(post.updates, []);
+    assert.equal(post.read?.transcriptPath, TRANSCRIPT_PATH);
+    assert.deepEqual(post.read?.taskLog, {
+      toolCallId: "call_1",
+      path: `/gemini/antigravity-cli/brain/${ROOT}/.system_generated/tasks/task-2.log`,
     });
-    assert.isTrue(result.updates.every(isWake));
-    assert.isFalse(follower.holding());
-    assert.deepEqual(follower.transcript(transcript(launchSteps, firstWake)).updates, []);
+    assert.isTrue(follower.wakeInProgress());
+    assert.deepEqual(follower.pendingToolCallIds(), []);
+
+    // The wake message and the model's answer are not in the transcript yet.
+    const updates = follower.ingest({
+      steps: transcript(launchSteps),
+      taskLog: { toolCallId: "call_1", text: "ONE\r\n" },
+    });
+    assert.deepEqual(summarize(updates), [["tool_call_update", "call_1", "completed"]]);
+    assert.deepEqual((updates[0] as { rawOutput?: unknown }).rawOutput, { combinedOutput: "ONE" });
+    assert.isTrue(updates.every(isWake));
+    assert.isTrue(follower.wakeInProgress());
   });
 
-  it("reports a held completion on its own when the wake never ends", () => {
+  it("corrects the card when the transcript later reports a failing exit code", () => {
     const follower = launched({ id: "call_1", args: ONE });
-    follower.hook(postToolUse(2, ONE));
-    assert.deepEqual(summarize(follower.flush()), [["tool_call_update", "call_1", "completed"]]);
-    assert.deepEqual(follower.flush(), []);
+    feed(follower, postToolUse(2, ONE), transcript(launchSteps), "ONE\r\n");
+    const failure = systemMessage(
+      `${ROOT}/task-2`,
+      `Task id "${ROOT}/task-2" finished with result:\nCommand exited with code 3.\n\nCommand output:\nONE\r\n\nLog: file:///x`,
+    );
+    const updates = feed(follower, preInvocation(5), [
+      ...transcript(launchSteps),
+      ...transcript([{ step_index: 5, type: "SYSTEM_MESSAGE", status: "DONE", content: failure }]),
+    ]);
+    assert.deepEqual(summarize(updates), [["tool_call_update", "call_1", "failed"]]);
+    assert.deepEqual((updates[0] as { rawOutput?: unknown }).rawOutput, {
+      combinedOutput: "ONE",
+      exitCode: 3,
+    });
+  });
+
+  it("streams a wake into one run: reply text and each tool when it starts, until Stop", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    const THREE = { CommandLine: "sleep 9", IsDaemon: false };
+    const wakeStart = [{ ...firstWake[0]! }];
+    const decided = {
+      step_index: 6,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "ONE is done. Starting the next one.",
+      tool_calls: [{ name: "run_command", args: THREE }],
+    };
+    const launching = {
+      step_index: 7,
+      type: "GENERIC",
+      status: "RUNNING",
+      content: `task id: ${ROOT}/task-7`,
+    };
+    const waiting = {
+      step_index: 8,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "Waiting for it.",
+    };
+
+    const completion = feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE\r\n");
+    assert.deepEqual(summarize(completion), [["tool_call_update", "call_1", "completed"]]);
+    assert.deepEqual(feed(follower, preInvocation(5), transcript(launchSteps, wakeStart)), []);
+
+    // The model has answered with a tool call: its card appears as the tool begins, under agy's id.
+    const started = feed(
+      follower,
+      preToolUse(7, THREE, "call_three"),
+      transcript(launchSteps, wakeStart, [decided]),
+    );
+    assert.deepEqual(summarize(started), [
+      ["agent_message_chunk", "ONE is done. Starting the next one.", null],
+      ["tool_call", "call_three", "in_progress"],
+    ]);
+    assert.isTrue(started.every(isWake));
+
+    // The command went to the background; the closing reply is held until the wake stops.
+    const backgrounded = feed(
+      follower,
+      preInvocation(8),
+      transcript(launchSteps, wakeStart, [decided, launching, waiting]),
+    );
+    assert.deepEqual(backgrounded, []);
+    assert.isTrue(follower.wakeInProgress());
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_three"]);
+
+    const stopped = feed(
+      follower,
+      hook("Stop", { fullyIdle: false }),
+      transcript(launchSteps, wakeStart, [decided, launching, waiting]),
+    );
+    assert.deepEqual(summarize(stopped), [["agent_message_chunk", "Waiting for it.", null]]);
+    assert.isFalse(follower.wakeInProgress());
+    assert.isFalse(follower.awaitingFinal());
+    // The command keeps running after the run ends.
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_three"]);
+
+    const finished = feed(
+      follower,
+      postToolUse(7, THREE, "run_command", "call_three"),
+      [],
+      "9\r\n",
+    );
+    assert.deepEqual(summarize(finished), [["tool_call_update", "call_three", "completed"]]);
+    assert.isTrue(follower.wakeInProgress());
+  });
+
+  it("runs a foreground tool of the wake from its start to its result", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    const LS = { CommandLine: "ls" };
+    const decided = {
+      step_index: 6,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      tool_calls: [{ name: "run_command", args: LS }],
+    };
+    feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE");
+    feed(follower, preInvocation(5), transcript(launchSteps, firstWake.slice(0, 1)));
+    const started = feed(
+      follower,
+      preToolUse(7, LS, "call_ls"),
+      transcript(launchSteps, [firstWake[0]!, decided]),
+    );
+    assert.deepEqual(summarize(started), [["tool_call", "call_ls", "in_progress"]]);
+    const result = { step_index: 7, type: "GENERIC", status: "DONE", content: "a.txt" };
+    const finished = feed(
+      follower,
+      preInvocation(8),
+      transcript(launchSteps, [firstWake[0]!, decided, result]),
+    );
+    assert.deepEqual(summarize(finished), [["tool_call_update", "call_ls", "completed"]]);
+    assert.deepEqual(follower.pendingToolCallIds(), []);
+  });
+
+  // Steps 33 to 35 of a real transcript: a reply with a malformed call, agy's error, the retry.
+  it("shows only the retry when agy rejected an attempt", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    const rejected = {
+      step_index: 6,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "**30s** finished. Started **40s** and waiting.\nAll four commands completed.",
+    };
+    const error = {
+      step_index: 7,
+      type: "ERROR_MESSAGE",
+      status: "DONE",
+      content:
+        "Error: Your previous response contained an improperly formatted function call: Malformed function call.\nRetries remaining: 3",
+    };
+    const retry = {
+      step_index: 8,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "**30s** finished. Started **40s** and waiting.",
+    };
+    feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE");
+    // Read while the rejected attempt is the last step: it is not delivered yet.
+    assert.deepEqual(
+      feed(follower, preInvocation(5), transcript(launchSteps, [firstWake[0]!, rejected])),
+      [],
+    );
+    assert.deepEqual(
+      feed(follower, preInvocation(5), transcript(launchSteps, [firstWake[0]!, rejected, error])),
+      [],
+    );
+    const updates = feed(
+      follower,
+      hook("Stop", { fullyIdle: true }),
+      transcript(launchSteps, [firstWake[0]!, rejected, error, retry]),
+    );
+    assert.deepEqual(summarize(updates), [
+      ["agent_message_chunk", "**30s** finished. Started **40s** and waiting.", null],
+    ]);
+    assert.isFalse(follower.wakeInProgress());
+  });
+
+  it("keeps the run open until the follow-up's last step is written", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE");
+    feed(follower, preInvocation(5), transcript(launchSteps, firstWake.slice(0, 1)));
+    // Stop lands before the transcript has the answer.
+    assert.deepEqual(
+      feed(
+        follower,
+        hook("Stop", { fullyIdle: true }),
+        transcript(launchSteps, firstWake.slice(0, 1)),
+      ),
+      [],
+    );
+    assert.isTrue(follower.awaitingFinal());
+    assert.isTrue(follower.wakeInProgress());
+    const late = follower.ingest({ steps: transcript(launchSteps, firstWake) });
+    assert.deepEqual(summarize(late), [
+      ["agent_message_chunk", "The first command has finished.\n\nONE", null],
+    ]);
+    assert.isFalse(follower.awaitingFinal());
+    assert.isFalse(follower.wakeInProgress());
+  });
+
+  it("gives up on a wake that never finishes and completes what it left open", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE");
+    feed(follower, preInvocation(5), transcript(launchSteps, firstWake.slice(0, 1)));
+    follower.hook(hook("Stop", { fullyIdle: true }));
+    assert.deepEqual(follower.endWake(), []);
+    assert.isFalse(follower.wakeInProgress());
+    assert.isFalse(follower.awaitingFinal());
   });
 
   it("follows two tasks in turn and strips the goal marker", () => {
     const follower = launched({ id: "call_1", args: ONE }, { id: "call_2", args: TWO });
-    follower.hook(postToolUse(2, ONE));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 }));
-    follower.hook(hook("Stop", { fullyIdle: false }));
-    const first = follower.transcript(transcript(launchSteps, firstWake));
+    feed(follower, postToolUse(2, ONE), [], "ONE");
+    feed(follower, preInvocation(5), transcript(launchSteps, firstWake));
+    const first = feed(
+      follower,
+      hook("Stop", { fullyIdle: false }),
+      transcript(launchSteps, firstWake),
+    );
     assert.deepEqual(
-      summarize(first.updates).map((update) => update[0]),
-      ["tool_call_update", "agent_message_chunk"],
+      summarize(first).map((update) => update[0]),
+      ["agent_message_chunk"],
     );
     assert.deepEqual(follower.pendingToolCallIds(), ["call_2"]);
 
-    follower.hook(postToolUse(3, TWO));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 7 }));
-    follower.hook(hook("Stop", { fullyIdle: true }));
-    const second = follower.transcript(transcript(launchSteps, firstWake, secondWake));
-    assert.deepEqual(summarize(second.updates), [
-      ["tool_call_update", "call_2", "completed"],
+    const card = feed(follower, postToolUse(3, TWO), [], "TWO");
+    assert.deepEqual(summarize(card), [["tool_call_update", "call_2", "completed"]]);
+    feed(follower, preInvocation(7), transcript(launchSteps, firstWake, secondWake));
+    const second = feed(
+      follower,
+      hook("Stop", { fullyIdle: true }),
+      transcript(launchSteps, firstWake, secondWake),
+    );
+    assert.deepEqual(summarize(second), [
       ["agent_message_chunk", "The second command has finished.\n\nTWO", null],
     ]);
     assert.deepEqual(follower.pendingToolCallIds(), []);
@@ -183,24 +406,20 @@ describe("AntigravityBackgroundFollower", () => {
   it("follows a schedule timer", () => {
     const args = { DurationSeconds: 20, Prompt: "Reply with the single word PING" };
     const follower = launched({ id: "call_s", name: "schedule", args });
-    follower.hook(postToolUse(2, args, "schedule"));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 4 }));
-    follower.hook(hook("Stop", { fullyIdle: true }));
-    const result = follower.transcript(
-      transcript([
-        {
-          step_index: 4,
-          type: "SYSTEM_MESSAGE",
-          status: "DONE",
-          content: systemMessage(`${ROOT}/task-2`, "Reply with the single word PING"),
-        },
-        { step_index: 5, type: "PLANNER_RESPONSE", status: "DONE", content: "PING" },
-      ]),
-    );
-    assert.deepEqual(summarize(result.updates), [
-      ["tool_call_update", "call_s", "completed"],
-      ["agent_message_chunk", "PING", null],
-    ]);
+    const wakeSteps = [
+      {
+        step_index: 4,
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        content: systemMessage(`${ROOT}/task-2`, "Reply with the single word PING"),
+      },
+      { step_index: 5, type: "PLANNER_RESPONSE", status: "DONE", content: "PING" },
+    ];
+    const card = feed(follower, postToolUse(2, args, "schedule"), []);
+    assert.deepEqual(summarize(card), [["tool_call_update", "call_s", "completed"]]);
+    feed(follower, preInvocation(4), transcript(wakeSteps));
+    const result = feed(follower, hook("Stop", { fullyIdle: true }), transcript(wakeSteps));
+    assert.deepEqual(summarize(result), [["agent_message_chunk", "PING", null]]);
   });
 
   it("leaves subagent wakes and foreign conversations alone", () => {
@@ -208,27 +427,28 @@ describe("AntigravityBackgroundFollower", () => {
     assert.deepEqual(follower.pendingToolCallIds(), []);
     assert.deepEqual(follower.hook(postToolUse(2, {}, "invoke_subagent")).updates, []);
     // A wake with no background task finishing before it is a subagent report.
-    follower.hook(hook("PreInvocation", { invocationNum: 2, initialNumSteps: 4 }));
-    const stop = follower.hook(hook("Stop", { fullyIdle: true }));
-    assert.isUndefined(stop.read);
-    assert.deepEqual(follower.transcript(transcript(launchSteps, firstWake)).updates, []);
+    assert.isUndefined(
+      follower.hook(hook("PreInvocation", { invocationNum: 2, initialNumSteps: 4 })).read,
+    );
+    assert.isUndefined(follower.hook(hook("Stop", { fullyIdle: true })).read);
+    assert.isFalse(follower.wakeInProgress());
 
     const other = launched({ id: "call_1", args: ONE });
     const child = other.hook({ ...postToolUse(2, ONE), conversationId: "child" });
     assert.deepEqual(child.updates, []);
+    assert.isUndefined(child.read);
     assert.deepEqual(other.pendingToolCallIds(), ["call_1"]);
   });
 
   it("completes a task that ends during a prompt without starting a wake", () => {
     const follower = launched({ id: "call_1", args: ONE });
     follower.promptStarted();
-    const done = follower.hook(postToolUse(2, ONE));
-    assert.deepEqual(summarize(done.updates), [["tool_call_update", "call_1", "completed"]]);
-    assert.isFalse(done.updates.some(isWake));
-    follower.hook(hook("PreInvocation", { invocationNum: 1, initialNumSteps: 5 }));
-    follower.hook(hook("Stop", { fullyIdle: true }));
-    const result = follower.transcript(transcript(launchSteps, firstWake));
-    assert.isFalse(result.updates.some((update) => update.sessionUpdate === "agent_message_chunk"));
+    const done = feed(follower, postToolUse(2, ONE), [], "ONE");
+    assert.deepEqual(summarize(done), [["tool_call_update", "call_1", "completed"]]);
+    assert.isFalse(done.some(isWake));
+    assert.isFalse(follower.wakeInProgress());
+    const rest = feed(follower, preInvocation(5), transcript(launchSteps, firstWake));
+    assert.isFalse(rest.some((update) => update.sessionUpdate === "agent_message_chunk"));
   });
 
   it("does not treat a command that finished inside its prompt as background work", () => {
@@ -251,62 +471,13 @@ describe("AntigravityBackgroundFollower", () => {
     follower.promptReturned();
     assert.deepEqual(follower.pendingToolCallIds(), []);
     assert.deepEqual(follower.hook(postToolUse(2, ONE)).updates, []);
-  });
-
-  it("waits for a follow-up the transcript has not written yet", () => {
-    const follower = launched({ id: "call_1", args: ONE });
-    follower.hook(postToolUse(2, ONE));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 }));
-    follower.hook(hook("Stop", { fullyIdle: true }));
-    const early = follower.transcript(transcript(launchSteps, firstWake.slice(0, 1)));
-    assert.isTrue(early.incomplete);
-    assert.isFalse(early.updates.some((update) => update.sessionUpdate === "agent_message_chunk"));
-    const late = follower.transcript(transcript(launchSteps, firstWake));
-    assert.isFalse(late.incomplete);
-    assert.deepEqual(summarize(late.updates).at(-1)?.[0], "agent_message_chunk");
-  });
-
-  it("emits the tools a follow-up ran and tracks one it backgrounds", () => {
-    const follower = launched({ id: "call_1", args: ONE });
-    follower.hook(postToolUse(2, ONE));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 }));
-    follower.hook(hook("Stop", { fullyIdle: false }));
-    const THREE = { CommandLine: "sleep 9", IsDaemon: false };
-    const result = follower.transcript(
-      transcript(launchSteps, [
-        firstWake[0]!,
-        {
-          step_index: 6,
-          type: "PLANNER_RESPONSE",
-          status: "DONE",
-          content: "Checking.",
-          tool_calls: [
-            { name: "run_command", args: { CommandLine: "ls" } },
-            { name: "run_command", args: THREE },
-          ],
-        },
-        { step_index: 7, type: "GENERIC", status: "DONE", content: "a.txt" },
-        { step_index: 8, type: "GENERIC", status: "RUNNING", content: `task id: ${ROOT}/task-8` },
-      ]),
-    );
-    assert.deepEqual(summarize(result.updates), [
-      ["tool_call_update", "call_1", "completed"],
-      ["agent_message_chunk", "Checking.", null],
-      ["tool_call", `agy-${ROOT}-6-0`, "in_progress"],
-      ["tool_call", `agy-${ROOT}-6-1`, "in_progress"],
-      ["tool_call_update", `agy-${ROOT}-6-0`, "completed"],
-    ]);
-    assert.deepEqual(follower.pendingToolCallIds(), [`agy-${ROOT}-6-1`]);
-    follower.hook(postToolUse(8, THREE));
-    assert.deepEqual(summarize(follower.flush()), [
-      ["tool_call_update", `agy-${ROOT}-6-1`, "completed"],
-    ]);
+    assert.isFalse(follower.wakeInProgress());
   });
 
   it("drops its tasks when the turn is stopped", () => {
     const follower = launched({ id: "call_1", args: ONE });
     follower.abandon();
-    assert.deepEqual(follower.hook(postToolUse(2, ONE)).updates, []);
+    assert.isUndefined(follower.hook(postToolUse(2, ONE)).read);
   });
 
   it("ends a command that was never backgrounded when its prompt fails", () => {
@@ -399,22 +570,27 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
 
   it("delivers each wake with only its own card and text, though the first Stop is not idle", () => {
     const follower = afterFirstWake();
-    follower.hook(postToolUse(8, ONE));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 11 }));
-    follower.hook(hook("Stop", { fullyIdle: false }));
+    const steps = transcript(priorWake, second);
+    const card = feed(follower, postToolUse(8, ONE), steps, "ONE");
     // The transcript may already hold the second wake when the first is read late.
-    const first = follower.transcript(transcript(priorWake, second));
-    assert.deepEqual(summarize(first.updates), [
+    const first = [
+      ...card,
+      ...feed(follower, preInvocation(11), steps),
+      ...feed(follower, hook("Stop", { fullyIdle: false }), steps),
+    ];
+    assert.deepEqual(summarize(first), [
       ["tool_call_update", "call_1", "completed"],
       ["agent_message_chunk", "ONE finished.", null],
     ]);
     assert.deepEqual(follower.pendingToolCallIds(), ["call_2"]);
 
-    follower.hook(postToolUse(9, TWO));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 13 }));
-    follower.hook(hook("Stop", { fullyIdle: true }));
-    const last = follower.transcript(transcript(priorWake, second));
-    assert.deepEqual(summarize(last.updates), [
+    const secondCard = feed(follower, postToolUse(9, TWO), steps, "TWO");
+    const last = [
+      ...secondCard,
+      ...feed(follower, preInvocation(13), steps),
+      ...feed(follower, hook("Stop", { fullyIdle: true }), steps),
+    ];
+    assert.deepEqual(summarize(last), [
       ["tool_call_update", "call_2", "completed"],
       ["agent_message_chunk", "TWO finished.", null],
     ]);
@@ -438,21 +614,16 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
     });
     follower.hook(hook("Stop", { fullyIdle: false }));
     follower.promptReturned();
-    follower.hook(
-      hook("PostToolUse", {
-        stepIdx: 9,
-        toolCall: { name: "run_command", args: ONE, id: "call_2" },
-      }),
-    );
+    follower.hook(postToolUse(9, ONE, "run_command", "call_2"));
     assert.deepEqual(follower.pendingToolCallIds(), ["call_1"]);
   });
 
   it("does not replay a delivered wake into the next prompt", () => {
     const follower = afterFirstWake();
-    follower.hook(postToolUse(8, ONE));
-    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 11 }));
-    follower.hook(hook("Stop", { fullyIdle: false }));
-    follower.transcript(transcript(priorWake, second));
+    const steps = transcript(priorWake, second);
+    feed(follower, postToolUse(8, ONE), steps, "ONE");
+    feed(follower, preInvocation(11), steps);
+    feed(follower, hook("Stop", { fullyIdle: false }), steps);
 
     // agy streams the wake it already reported once the next prompt starts.
     follower.promptStarted();
@@ -462,13 +633,59 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
       status: "completed",
     } as const;
     assert.isTrue(follower.isReplay(replayedCard));
-    const text = (value: string) =>
-      ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: value } }) as const;
-    assert.isTrue(follower.isReplay(text("ONE fin")));
-    assert.isTrue(follower.isReplay(text("ished.")));
-    assert.isFalse(follower.isReplay(text("ONE finished.")));
+    assert.isTrue(follower.isReplay(chunk("ONE fin")));
+    assert.isTrue(follower.isReplay(chunk("ished.")));
+    assert.isFalse(follower.isReplay(chunk("ONE finished.")));
     assert.isFalse(follower.isReplay({ ...replayedCard, toolCallId: "call_2" }));
-    assert.isFalse(follower.isReplay(text("a fresh answer")));
+    assert.isFalse(follower.isReplay(chunk("a fresh answer")));
+  });
+
+  // The wake started this command under an id of ours; agy replays it under its own `call_` id.
+  it("recognises a replayed tool by its command when agy names no id in its hooks", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    const THREE = { CommandLine: "sleep 9", IsDaemon: false };
+    const decided = {
+      step_index: 6,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "Next.",
+      tool_calls: [{ name: "run_command", args: THREE }],
+    };
+    const launching = {
+      step_index: 7,
+      type: "GENERIC",
+      status: "RUNNING",
+      content: `task id: ${ROOT}/task-7`,
+    };
+    const closing = {
+      step_index: 8,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      content: "Waiting.",
+    };
+    const steps = transcript(launchSteps, [firstWake[0]!, decided, launching, closing]);
+    feed(follower, postToolUse(2, ONE), steps, "ONE");
+    const streamed = feed(follower, preInvocation(5), steps);
+    feed(follower, hook("Stop", { fullyIdle: false }), steps);
+    const launchedCard = summarize(streamed).find((update) => update[0] === "tool_call");
+    assert.equal(launchedCard?.[1], `agy-${ROOT}-6-0`);
+
+    follower.promptStarted();
+    const replay = {
+      sessionUpdate: "tool_call",
+      toolCallId: "call_1073786428767115049",
+      name: "run_command",
+      rawInput: THREE,
+      status: "in_progress",
+    } as const;
+    assert.isTrue(follower.isReplay(replay));
+    assert.isTrue(
+      follower.isReplay({ ...replay, sessionUpdate: "tool_call_update", status: "completed" }),
+    );
+    assert.isTrue(follower.isReplay(chunk("Next.")));
+    assert.isTrue(follower.isReplay(chunk("Waiting.")));
+    // A command the user's new prompt runs is not a replay, even with the same text.
+    assert.isFalse(follower.isReplay({ ...replay, toolCallId: "call_new" }));
   });
 });
 

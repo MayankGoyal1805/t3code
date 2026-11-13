@@ -10,7 +10,7 @@ import * as Path from "effect/Path";
 export const ANTIGRAVITY_HOOK_NAME = "t3-code";
 export const ANTIGRAVITY_HOOK_EVENTS_ENV = "T3CODE_AGY_HOOK_EVENTS";
 
-const HOOK_EVENTS = ["PreInvocation", "PostToolUse", "Stop"] as const;
+const HOOK_EVENTS = ["PreInvocation", "PreToolUse", "PostToolUse", "Stop"] as const;
 
 /**
  * Hook stdout is interpreted by agy and a failing hook must not fail a turn, so this prints
@@ -24,6 +24,7 @@ const hookCommand = (event: (typeof HOOK_EVENTS)[number]) =>
 
 const desiredEntry = () => ({
   PreInvocation: [{ command: hookCommand("PreInvocation") }],
+  PreToolUse: [{ matcher: "*", hooks: [{ command: hookCommand("PreToolUse"), timeout: 10 }] }],
   PostToolUse: [{ matcher: "*", hooks: [{ command: hookCommand("PostToolUse"), timeout: 10 }] }],
   Stop: [{ command: hookCommand("Stop") }],
 });
