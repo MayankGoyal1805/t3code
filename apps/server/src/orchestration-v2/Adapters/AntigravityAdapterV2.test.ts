@@ -1071,6 +1071,82 @@ describe("AntigravityAdapterV2 background work", () => {
     content,
   });
 
+  const SCHEDULE = { DurationSeconds: 20, Prompt: "Reply with the single word PING" };
+  const schedule: PromptFrames = (prompt, send) =>
+    prompt === 0
+      ? send({
+          sessionUpdate: "tool_call",
+          toolCallId: "call_schedule",
+          name: "schedule",
+          title: "Run schedule",
+          kind: "other",
+          rawInput: SCHEDULE,
+          status: "in_progress",
+        })
+      : Effect.void;
+
+  it.live(
+    "keeps a schedule timer's card running until it fires, then completes it with the follow-up",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness(schedule);
+        const { session, startTurn, collectTurn, fileSystem, transcriptPath, offers } = h;
+        yield* startTurn(1, { createdBy: "user", creationSource: "web", text: "/schedule in 20s" });
+        const first = (yield* collectTurn).flatMap((event) =>
+          event.type === "turn_item.updated" ? [event.turnItem] : [],
+        );
+        const timerOf = (items: typeof first) =>
+          items.findLast((item) => item.type === "dynamic_tool");
+        assert.equal(timerOf(first)?.status, "running");
+        assert.isTrue(yield* session.hasPendingBackgroundWork!);
+
+        const common = { transcriptPath };
+        yield* fileSystem.writeFileString(
+          transcriptPath,
+          jsonl([
+            {
+              step_index: 4,
+              type: "SYSTEM_MESSAGE",
+              status: "DONE",
+              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=t sender=${SESSION}/task-2 priority=HIGH content=${SCHEDULE.Prompt}\n</SYSTEM_MESSAGE>`,
+            },
+            answerStep(5, "PING"),
+          ]),
+        );
+        yield* fileSystem.writeFileString(
+          h.eventsFile()!,
+          hookLine("Stop", { ...common, fullyIdle: false }) +
+            hookLine("PostToolUse", {
+              ...common,
+              stepIdx: 2,
+              toolCall: { name: "schedule", args: SCHEDULE },
+              error: "",
+            }) +
+            hookLine("PreInvocation", { ...common, invocationNum: 0, initialNumSteps: 4 }) +
+            hookLine("Stop", { ...common, fullyIdle: true }),
+        );
+        yield* Queue.take(offers);
+        yield* startTurn(2, {
+          createdBy: "agent",
+          creationSource: "provider",
+          text: "Background task completed.",
+        });
+        const woken = (yield* collectTurn).flatMap((event) =>
+          event.type === "turn_item.updated" ? [event.turnItem] : [],
+        );
+        assert.equal(timerOf(woken)?.status, "completed");
+        assert.deepEqual(
+          [
+            ...new Set(
+              woken.flatMap((item) => (item.type === "assistant_message" ? [item.text] : [])),
+            ),
+          ],
+          ["PING"],
+        );
+        assert.isFalse(yield* session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
   it.live("delivers each of two background tasks in its own continuation run", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness(twoCommands);

@@ -89,6 +89,21 @@ describe("AntigravityWakeTracker", () => {
       pending: true,
     },
     {
+      name: "a tool step that failed before the report (agy status 7)",
+      rows: [
+        ...launchedLog.slice(0, 3),
+        { type: 132, payload: new Uint8Array(), metadata: new Uint8Array(), status: 7 },
+        launchNote,
+        wake,
+        answer,
+      ],
+      outputs: [
+        { type: "text", text: "README.md has 1 line." },
+        { type: "completed", toolCallId: CALL_ID, result: "README.md has 1 line." },
+      ],
+      pending: false,
+    },
+    {
       name: "an unfinished follow-up step",
       rows: [...launchedLog, wake, { ...answer, status: 2 }],
       outputs: [],

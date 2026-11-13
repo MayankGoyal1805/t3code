@@ -15,7 +15,9 @@ const USER_INPUT_STEP = 14;
 const PLANNER_STEP = 15;
 const INBOUND_MESSAGE_STEP = 101;
 const TOOL_STEP = 132;
-const STEP_DONE = 3;
+/** agy step statuses that are still being worked on; any other status (done, error) is final. */
+const STEP_RUNNING = 2;
+const STEP_GENERATING = 8;
 const PLANNER_RESPONSE = 20;
 const PLANNER_TEXT = 1;
 const PLANNER_FINAL_TEXT = 8;
@@ -137,7 +139,7 @@ export function makeAntigravityWakeTracker() {
       const outputs: Array<AntigravityWakeOutput> = [];
       for (const step of steps) {
         // A step still being written is read again, so output keeps the log's order.
-        if (step.status !== STEP_DONE) break;
+        if (step.status === STEP_RUNNING || step.status === STEP_GENERATING) break;
         cursor = step.idx;
         if (step.payload === null) {
           // An oversized planner step cannot be read, but it must still end the wake.
