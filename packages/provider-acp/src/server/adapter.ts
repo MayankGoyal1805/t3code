@@ -532,6 +532,8 @@ export interface AcpAdapterV2Flavor {
    * is still running, do not apply to it.
    */
   readonly wakeNotificationsAreComplete?: boolean;
+  /** True while the provider is still delivering a wake; a continuation run stays open until it is not. */
+  readonly isProviderWakeInProgress?: () => boolean;
   readonly assertComplete?: Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Interrupt the local prompt fiber before `session/cancel` (Grok wedged prompts). */
   readonly interruptPromptOnCancel?: boolean;
@@ -2216,6 +2218,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           readonly providerThreadId: ProviderThreadId;
         } | null>(null);
         const wakeBuffer = yield* Ref.make<Array<EffectAcpSchema.SessionNotification>>([]);
+        // A background tool can end in a later run; its card keeps the time it started.
+        const backgroundToolStartedAt = new Map<string, DateTime.Utc>();
         const noWakeReports = {
           reports: new Map<string, BackgroundWorkReport>(),
           offered: new Set<string>(),
@@ -4059,8 +4063,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             nativeId: toolCall.toolCallId,
             strength: "strong" as const,
           };
-          const startedAt = context.toolStartedAt.get(toolCall.toolCallId) ?? now;
+          const startedAt =
+            context.toolStartedAt.get(toolCall.toolCallId) ??
+            backgroundToolStartedAt.get(toolCall.toolCallId) ??
+            now;
           context.toolStartedAt.set(toolCall.toolCallId, startedAt);
+          if (backgroundTaskId !== undefined) {
+            if (status === "pending" || status === "running") {
+              backgroundToolStartedAt.set(toolCall.toolCallId, startedAt);
+            } else {
+              backgroundToolStartedAt.delete(toolCall.toolCallId);
+            }
+          }
           const completedAt = completedAtForStatus(status, now);
           const title = toolCall.title ?? null;
           yield* emitProviderEvent({
@@ -7849,17 +7863,21 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context.backgroundFinalizeGeneration += 1;
           const generation = context.backgroundFinalizeGeneration;
           yield* Effect.gen(function* () {
-            yield* Effect.sleep(ACP_DEFERRED_FINALIZE_DEBOUNCE);
-            if (
-              context.finalized ||
-              context.interrupted ||
-              context.backgroundFinalizeGeneration !== generation
-            ) {
+            while (true) {
+              yield* Effect.sleep(ACP_DEFERRED_FINALIZE_DEBOUNCE);
+              if (
+                context.finalized ||
+                context.interrupted ||
+                context.backgroundFinalizeGeneration !== generation
+              ) {
+                return;
+              }
+              if (hasDeferredBackgroundWork(context)) return;
+              if (flavor.isProviderWakeInProgress?.() === true) continue;
+              const status = context.promptSettledStatus ?? "completed";
+              yield* finalizeTurn(context, status);
               return;
             }
-            if (hasDeferredBackgroundWork(context)) return;
-            const status = context.promptSettledStatus ?? "completed";
-            yield* finalizeTurn(context, status);
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           yield* (
             options.testHooks?.onDeferredFinalizeScheduled?.(ACP_DEFERRED_FINALIZE_DEBOUNCE) ??

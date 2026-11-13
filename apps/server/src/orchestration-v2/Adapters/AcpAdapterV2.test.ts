@@ -8433,6 +8433,170 @@ describe("AcpAdapterV2", () => {
   );
 
   it.effect(
+    "holds a continuation run open while the provider streams its wake, and keeps a background tool's start time",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+          [];
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        let wakeInProgress = false;
+        const wakeMeta = { _meta: { testWake: true } };
+        const instanceId = ProviderInstanceId.make("acp-test");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            deferFinalizeForBackgroundWork: true,
+            enablePostSettleContinuation: true,
+            wakeNotificationsAreComplete: true,
+            isProviderWakeNotification: (notification) =>
+              "_meta" in notification.update && notification.update._meta?.testWake === true,
+            extractBackgroundTaskId: (toolCall) =>
+              toolCall.toolCallId.startsWith("bg_") ? toolCall.toolCallId : undefined,
+            isPersistentBackgroundTool: () => true,
+            isProviderWakeInProgress: () => wakeInProgress,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdateHandler = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: (payload) =>
+                  sessionUpdateHandler!({
+                    sessionId: "mock-session-1",
+                    update: {
+                      sessionUpdate: "tool_call",
+                      toolCallId: "bg_1",
+                      title: "sleep 30",
+                      kind: "execute",
+                      status: "in_progress",
+                      rawInput: { CommandLine: "sleep 30" },
+                    },
+                  }).pipe(Effect.andThen(runtime.prompt(payload))),
+              }),
+            }),
+          },
+          selfInvocation,
+          continuationRequests: {
+            offer: (request) => Effect.sync(() => void continuationRequests.push(request)),
+          },
+        });
+        const threadId = ThreadId.make("thread-acp-streamed-wake");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-streamed-wake"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        const terminalQueue = yield* Queue.unbounded<string>();
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) =>
+            Effect.sync(() => void events.push(event)).pipe(
+              Effect.andThen(
+                event.type === "turn.terminal"
+                  ? Queue.offer(terminalQueue, event.status)
+                  : Effect.void,
+              ),
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const startedAt = yield* DateTime.now;
+        yield* runtime.startTurn(
+          makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now: startedAt }),
+        );
+        const terminals = () =>
+          events.filter((event) => event.type === "turn.terminal").map((event) => event.status);
+        yield* Queue.take(terminalQueue);
+
+        yield* TestClock.adjust("5 seconds");
+        yield* sessionUpdateHandler!({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "bg_1",
+            status: "completed",
+            rawOutput: "done",
+            ...wakeMeta,
+          },
+        });
+        assert.lengthOf(continuationRequests, 1);
+        wakeInProgress = true;
+        yield* runtime.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            ordinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+            messageText: "Background task completed.",
+          }),
+        );
+
+        // The model is slow: no update arrives for longer than the quiet window.
+        yield* TestClock.adjust("10 seconds");
+        assert.deepEqual(terminals(), ["completed"]);
+        yield* sessionUpdateHandler!({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "late reply" },
+            ...wakeMeta,
+          },
+        });
+        yield* TestClock.adjust("10 seconds");
+        assert.deepEqual(terminals(), ["completed"]);
+
+        wakeInProgress = false;
+        yield* TestClock.adjust("3 seconds");
+        yield* Queue.take(terminalQueue);
+        const reply = events.findLast(
+          (event) => event.type === "message.updated" && event.message.role === "assistant",
+        );
+        assert.equal(reply?.type === "message.updated" && reply.message.text, "late reply");
+        const card = events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.nativeItemRef?.nativeId === "bg_1",
+        );
+        assert.equal(card?.type === "turn_item.updated" && card.turnItem.status, "completed");
+        assert.equal(
+          card?.type === "turn_item.updated" && card.turnItem.startedAt?.toString(),
+          startedAt.toString(),
+        );
+        assert.equal(
+          card?.type === "turn_item.updated" && card.turnItem.completedAt?.toString(),
+          DateTime.add(startedAt, { seconds: 5 }).toString(),
+        );
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect(
     "staggered pre-settle completion keeps midTurn marks until last background task ends post-finalize",
     () =>
       Effect.gen(function* () {
