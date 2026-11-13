@@ -12,7 +12,12 @@ import { type SelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeRun
 import { varintField } from "./AntigravityProto.ts";
 
 /** agy versions whose private conversation storage this module was verified against. */
-const ANTIGRAVITY_ROLLBACK_TESTED_VERSIONS: ReadonlyArray<string> = ["1.5.0", "1.5.1", "1.5.3"];
+const ANTIGRAVITY_ROLLBACK_TESTED_VERSIONS: ReadonlyArray<string> = [
+  "1.5.0",
+  "1.5.1",
+  "1.5.3",
+  "1.5.8",
+];
 
 class AntigravityRollbackError extends Schema.TaggedError<AntigravityRollbackError>()(
   "AntigravityRollbackError",

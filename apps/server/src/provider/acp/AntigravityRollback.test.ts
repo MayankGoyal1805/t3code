@@ -8,6 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import {
+  isAntigravityRollbackVersionTested,
   rollbackAntigravityConversation,
   rollbackAntigravityConversationOffThread,
 } from "./AntigravityRollback.ts";
@@ -202,6 +203,7 @@ describe("rollbackAntigravityConversation", () => {
       writeConversation(sourceFile);
 
       assert.isUndefined(yield* rollback(directory, { version: "1.4.5" }));
+      assert.isTrue(isAntigravityRollbackVersionTested("1.5.8"));
       assert.isUndefined(yield* rollback(directory, { keepTurns: 0 }));
       assert.isUndefined(yield* rollback(directory, { keepTurns: 3 }));
       assert.isUndefined(yield* rollback(directory, { expectedTurns: 2 }));
