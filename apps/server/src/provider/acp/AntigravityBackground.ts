@@ -75,7 +75,11 @@ interface Wake {
   /** Calls the transcript named, in order, awaiting their result steps. */
   open: TrackedTool[];
   /** PreToolUse hooks not yet matched to a call the transcript named. */
-  starts: Array<{ readonly name: string; readonly args: unknown; readonly id?: string | null }>;
+  starts: Array<{
+    readonly name: string;
+    readonly args: unknown;
+    readonly id: string | null | undefined;
+  }>;
   /** agy's reply has been seen; whatever follows it in the transcript belongs to a later wake. */
   ended: boolean;
 }

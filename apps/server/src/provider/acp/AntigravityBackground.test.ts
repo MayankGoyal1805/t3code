@@ -675,6 +675,7 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
       sessionUpdate: "tool_call",
       toolCallId: "call_1073786428767115049",
       name: "run_command",
+      title: THREE.CommandLine,
       rawInput: THREE,
       status: "in_progress",
     } as const;
