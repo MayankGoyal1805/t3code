@@ -12,6 +12,8 @@ import {
   makeAntigravityUserInputResponse,
   normalizeAntigravitySessionUpdate,
   normalizeAntigravityToolCall,
+  antigravityToolPresentation,
+  parseAntigravityCommandResult,
   sanitizeAntigravityToolPayload,
 } from "./AntigravityProtocol.ts";
 import {
@@ -267,6 +269,54 @@ describe("Antigravity permissions and questions", () => {
 });
 
 describe("Antigravity tool results", () => {
+  // `echo FG` and an in-turn background `exit 3`, as agy reported them.
+  it.each([
+    [
+      "Created At: 2026-11-13T09:43:15Z\nCompleted At: 2026-11-13T09:43:21Z\nCommand exited with code 0.\n\nCommand output:\nFG\r\n",
+      { exitCode: 0, output: "FG" },
+    ],
+    ["Command exited with code 3.\n\nCommand output:\noops\r\n", { exitCode: 3, output: "oops" }],
+    [
+      "Command exited with code 0.\n\nNo output from the command.",
+      { exitCode: 0, output: undefined },
+    ],
+  ])("reads the exit code and output from agy's command header: %#", (text, expected) => {
+    expect(parseAntigravityCommandResult(text)).toEqual(expected);
+  });
+
+  it("shows only the command's output and takes its exit code from the header", () => {
+    const toolCall = normalizeAntigravityToolCall({
+      toolCallId: "call_1",
+      kind: "execute",
+      status: "completed",
+      data: {
+        rawInput: { CommandLine: "echo FG" },
+        rawOutput:
+          "Created At: 2026-11-13T09:43:15Z\nCompleted At: 2026-11-13T09:43:21Z\nCommand exited with code 0.\n\nCommand output:\nFG\r\n",
+      },
+    });
+    expect(toolCall.data.rawOutput).toEqual({ combinedOutput: "FG", exitCode: 0 });
+  });
+
+  it("presents a write_file the way agy announces it live", () => {
+    expect(
+      antigravityToolPresentation("write_file", {
+        Content: "2\n",
+        Overwrite: true,
+        Path: "/tmp/agy-goal-test/g2.txt",
+      }),
+    ).toEqual({
+      title: "File g2.txt",
+      kind: "edit",
+      locations: [{ path: "/tmp/agy-goal-test/g2.txt" }],
+      content: [{ type: "diff", path: "/tmp/agy-goal-test/g2.txt", newText: "2\n" }],
+    });
+    expect(antigravityToolPresentation("schedule", { Prompt: "x" })).toEqual({
+      title: "Run schedule",
+      kind: "other",
+    });
+  });
+
   it("normalizes the captured command and completed output for the existing clients", () => {
     const initial = parseToolUpdate(commandStarted).toolCall;
     const completed = parseToolUpdate(commandCompleted).toolCall;

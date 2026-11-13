@@ -102,6 +102,45 @@ export function antigravityApprovalOptions(
   return options;
 }
 
+const COMMAND_RESULT =
+  /^(?:(?:Created|Completed) At: [^\n]*\n)*Command exited with code (-?\d+)\.\r?\n\r?\n(?:Command output:\r?\n([\s\S]*)|No output from the command\.?\s*)$/;
+
+/** agy wraps a command's output in a header carrying its timestamps and exit code. */
+export function parseAntigravityCommandResult(
+  text: string,
+): { readonly exitCode: number; readonly output: string | undefined } | undefined {
+  const match = COMMAND_RESULT.exec(text);
+  if (match === null) return undefined;
+  const output = match[2]?.replaceAll("\r\n", "\n").trimEnd();
+  return {
+    exitCode: Number(match[1]),
+    output: output === undefined || output.length === 0 ? undefined : output,
+  };
+}
+
+const basename = (path: string) => path.split(/[\\/]/).findLast((part) => part.length > 0) ?? path;
+
+/** What agy's own `tool_call` announces for a call, for callers that only see the transcript. */
+export function antigravityToolPresentation(name: string, args: unknown) {
+  const input = Predicate.isObject(args) ? args : {};
+  const commandLine = input.CommandLine;
+  if (typeof commandLine === "string" && commandLine.trim().length > 0) {
+    return { title: commandLine.trim(), kind: "execute" } as const;
+  }
+  const path = input.Path;
+  if (name === "write_file" && typeof path === "string" && path.length > 0) {
+    return {
+      title: `File ${basename(path)}`,
+      kind: "edit",
+      locations: [{ path }],
+      ...(typeof input.Content === "string"
+        ? { content: [{ type: "diff", path, newText: input.Content }] }
+        : {}),
+    } as const;
+  }
+  return { title: `Run ${name}`, kind: "other" } as const;
+}
+
 function copyBoundedText(text: string): string {
   return Buffer.from(text, "utf16le").toString("utf16le");
 }
@@ -334,7 +373,15 @@ export function normalizeAntigravityToolCall(
   readPreEditFile = readAntigravityPreEditFile,
 ): AcpToolCallState {
   const input = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawInput));
-  const output = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawOutput));
+  const rawOutput = toolCall.data.rawOutput;
+  const result = parseAntigravityCommandResult(
+    typeof rawOutput === "string"
+      ? rawOutput
+      : (Option.getOrUndefined(decodeNativeToolFields(rawOutput))?.combinedOutput ?? ""),
+  );
+  const output = Option.getOrUndefined(
+    decodeNativeToolFields(result === undefined ? rawOutput : undefined),
+  );
   const nativeCommand =
     input?.CommandLine ??
     input?.command_line ??
@@ -353,9 +400,11 @@ export function normalizeAntigravityToolCall(
     output?.workingDir ??
     output?.working_dir;
   const cwd = nativeCwd?.trim() ? boundText(nativeCwd.trim()) : undefined;
-  const nativeOutput = output?.combinedOutput ?? output?.combined_output ?? output?.output;
+  const nativeOutput = result
+    ? result.output
+    : (output?.combinedOutput ?? output?.combined_output ?? output?.output);
   const aggregatedOutput = nativeOutput === undefined ? undefined : boundText(nativeOutput);
-  const exitCode = output?.exitCode ?? output?.exit_code;
+  const exitCode = result?.exitCode ?? output?.exitCode ?? output?.exit_code;
   const imagePath = localImagePath(output?.imagePath);
   const sanitizedData = sanitizeAntigravityToolPayload(toolCall.data);
   const data: Record<string, unknown> = Predicate.isObject(sanitizedData) ? sanitizedData : {};
@@ -376,6 +425,12 @@ export function normalizeAntigravityToolCall(
       : [...content, { type: "diff", patch: { format: "omitted" } }];
   }
   if (kind === "execute") {
+    if (result !== undefined) {
+      data.rawOutput = {
+        ...(aggregatedOutput === undefined ? {} : { combinedOutput: aggregatedOutput }),
+        exitCode: result.exitCode,
+      };
+    }
     data.item = {
       ...(Predicate.isObject(data.item) ? data.item : {}),
       ...(command !== undefined ? { command } : {}),
