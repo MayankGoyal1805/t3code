@@ -595,6 +595,8 @@ export interface ProviderAdapterV2RollbackThreadInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly target: ProviderAdapterV2RollbackTarget;
   readonly providerThreadTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+  /** Turns the provider itself started (a wake), which no user message of the provider's own conversation opens. */
+  readonly providerStartedTurnIds?: Effect.Effect<ReadonlySet<ProviderTurnId>>;
 }
 
 export interface ProviderAdapterV2ForkThreadInput {

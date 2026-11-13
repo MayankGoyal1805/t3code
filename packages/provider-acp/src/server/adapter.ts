@@ -26,6 +26,7 @@ import {
   type ProviderDriverKind,
   type ProviderRequestKind,
   type ProviderThreadId,
+  type ProviderTurnId,
   type ProviderUserInputAnswers,
   type RuntimeMode,
   type RuntimeRequestId,
@@ -370,10 +371,17 @@ export interface AcpAdapterV2Flavor {
    * Truncates the agent's native conversation to the rollback target. Returns the id of the
    * truncated session to load, or undefined (also on failure) to fall back to a fresh session.
    */
+  /**
+   * When the native rollback is refused or its copy cannot be loaded, leave the thread pointing at
+   * a native session that does not exist, so the next turn start recovers the kept history as
+   * portable context instead of beginning in a silently empty session.
+   */
+  readonly recoverContextAfterRefusedRollback?: boolean;
   readonly rollbackSession?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly target: ProviderAdapter.ProviderAdapterV2RollbackTarget;
     readonly providerThreadTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+    readonly providerStartedTurnIds?: Effect.Effect<ReadonlySet<ProviderTurnId>>;
     readonly cwd: string;
     readonly nativeSessionId: string;
   }) => Effect.Effect<{ readonly sessionId: string } | undefined>;
@@ -9368,6 +9376,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   prepareTerminalEnvironment(
                     yield* readMcpContext(rollbackInput.providerThread.appThreadId),
                   );
+                  const priorNativeSessionId = yield* nativeThreadId(
+                    driver,
+                    rollbackInput.providerThread,
+                  );
                   const rolledBack =
                     flavor.rollbackSession === undefined
                       ? undefined
@@ -9376,11 +9388,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                             providerThread: rollbackInput.providerThread,
                             target: rollbackInput.target,
                             providerThreadTurns: rollbackInput.providerThreadTurns,
+                            ...(rollbackInput.providerStartedTurnIds === undefined
+                              ? {}
+                              : { providerStartedTurnIds: rollbackInput.providerStartedTurnIds }),
                             cwd: input.runtimePolicy.cwd ?? process.cwd(),
-                            nativeSessionId: yield* nativeThreadId(
-                              driver,
-                              rollbackInput.providerThread,
-                            ),
+                            nativeSessionId: priorNativeSessionId,
                           })
                           .pipe(
                             Effect.catchCause((cause) =>
@@ -9400,15 +9412,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         ),
                       resumeSessionId,
                     ).pipe(Effect.retry({ times: 1 }));
-                  const replacement =
+                  const unavailableSession: { readonly sessionId: string } | undefined =
+                    flavor.recoverContextAfterRefusedRollback === true &&
+                    rollbackInput.target.type === "provider_turn"
+                      ? { sessionId: `${priorNativeSessionId}:rolled-back` }
+                      : undefined;
+                  const replacement: { readonly sessionId: string } =
                     rolledBack === undefined
-                      ? yield* startReplacement()
+                      ? (unavailableSession ?? (yield* startReplacement()))
                       : yield* startReplacement(rolledBack.sessionId).pipe(
                           Effect.catchCause((cause) =>
                             Effect.logWarning(
                               "loading rolled-back ACP session failed; starting a fresh session",
                               { driver, cause },
-                            ).pipe(Effect.andThen(startReplacement())),
+                            ).pipe(
+                              Effect.andThen(
+                                unavailableSession === undefined
+                                  ? startReplacement()
+                                  : Effect.succeed(unavailableSession),
+                              ),
+                            ),
                           ),
                         );
                   const now = yield* DateTime.now;

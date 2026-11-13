@@ -4,6 +4,7 @@ import {
   latestProviderTurnForAttempt,
   type OrchestrationV2DomainEvent,
   ProviderThreadId,
+  type ProviderTurnId,
   ThreadId,
   VcsProcessExitError,
 } from "@t3tools/contracts";
@@ -290,6 +291,28 @@ export const layer: Layer.Layer<
               providerThread,
               target: rollbackTarget,
               providerThreadTurns,
+              providerStartedTurnIds: Effect.forEach(
+                providerThreadTurns.filter((turn) => turn.runAttemptId !== null),
+                (turn) =>
+                  Effect.gen(function* () {
+                    const { attempt } = yield* projections.getProviderControlContext(
+                      input.threadId,
+                      {
+                        providerThreadId: providerThread.id,
+                        providerTurnId: turn.id,
+                        attemptId: turn.runAttemptId!,
+                      },
+                    );
+                    const message =
+                      attempt === undefined
+                        ? undefined
+                        : yield* projections.getRunMessage(input.threadId, attempt.runId);
+                    return message?.creationSource === "provider" ? [turn.id] : [];
+                  }),
+              ).pipe(
+                Effect.map((ids) => new Set(ids.flat())),
+                Effect.orElseSucceed(() => new Set<ProviderTurnId>()),
+              ),
             });
       if (input.restoreFiles !== false) yield* checkpoints.restore({ scope, checkpoint });
       if (staleCheckpoints.length > 0) {

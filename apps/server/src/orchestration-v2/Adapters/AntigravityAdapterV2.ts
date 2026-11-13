@@ -2,6 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderTurnId,
   type OrchestrationV2ProviderCapabilities,
   type ProviderSetupError,
 } from "@t3tools/contracts";
@@ -234,8 +235,10 @@ function followSubagentWake(
   runtime: AntigravityRuntime,
   scope: Scope.Scope,
   profileDirectory: string,
+  pendingReport: { pending: () => boolean },
 ): AntigravityRuntime {
   const tracker = makeAntigravityWakeTracker();
+  pendingReport.pending = () => tracker.pending();
   const launchInputs = new Map<string, unknown>();
   let deliver: Parameters<AntigravityRuntime["handleSessionUpdate"]>[0] | undefined;
   let following: Fiber.Fiber<void> | undefined;
@@ -343,6 +346,7 @@ function followBackgroundWork(
   fileSystem: FileSystem.FileSystem,
   eventsFile: string,
   holdRun: (inProgress: () => boolean) => void,
+  subagentReportPending: () => boolean,
 ): AntigravityRuntime {
   const follower = makeAntigravityBackgroundFollower();
   holdRun(() => follower.wakeInProgress());
@@ -408,7 +412,7 @@ function followBackgroundWork(
   const onHook = Effect.fn("AntigravityAdapterV2.followBackgroundHook")(function* (
     event: Parameters<typeof follower.hook>[0],
   ) {
-    const step = follower.hook(event);
+    const step = follower.hook(event, subagentReportPending());
     yield* send(step.updates);
     if (step.read !== undefined) yield* ingest(step.read);
     if (follower.awaitingFinal() && settling === undefined) {
@@ -559,6 +563,7 @@ export function makeAntigravityAcpAdapterFlavor(
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
+      const pendingReport = { pending: () => false };
       const background =
         hookEventsFile === undefined
           ? runtime
@@ -570,11 +575,12 @@ export function makeAntigravityAcpAdapterFlavor(
               (inProgress) => {
                 wakeInProgress = inProgress;
               },
+              () => pendingReport.pending(),
             );
       const followed =
         profileDirectory === undefined
           ? background
-          : followSubagentWake(background, scope, profileDirectory);
+          : followSubagentWake(background, scope, profileDirectory, pendingReport);
       return {
         ...followed,
         loadSession: (sessionId, activation) =>
@@ -606,18 +612,46 @@ export function makeAntigravityAcpAdapterFlavor(
   // Rolled-back state is a truncated copy of the native conversation, loaded under a new id.
   const rollbackSession: AcpAdapterV2Flavor["rollbackSession"] = Effect.fn(
     "AntigravityAdapterV2.rollbackSession",
-  )(function* ({ target, providerThreadTurns, nativeSessionId }) {
+  )(function* ({ target, providerThreadTurns, providerStartedTurnIds, nativeSessionId }) {
     if (profileDirectory === undefined || target.type !== "provider_turn") return undefined;
-    const terminalTurns = providerThreadTurns.filter(
-      (turn) => turn.nativeTurnRef !== null && TERMINAL_TURN_STATUSES.has(turn.status),
+    const providerStarted =
+      providerStartedTurnIds === undefined
+        ? new Set<ProviderTurnId>()
+        : yield* providerStartedTurnIds;
+    // A wake the provider started has no user step in agy's conversation, so only the turns
+    // that carry a prompt pair with those steps.
+    const promptTurns = providerThreadTurns.filter(
+      (turn) =>
+        turn.nativeTurnRef?.nativeId?.startsWith(`${nativeSessionId}:turn:`) === true &&
+        TERMINAL_TURN_STATUSES.has(turn.status) &&
+        !providerStarted.has(turn.id),
     );
-    return yield* rollbackAntigravityConversationOffThread(options.selfInvocation, {
-      conversationsDir: options.path.join(profileDirectory, ...ANTIGRAVITY_CONVERSATION_SEGMENTS),
+    // The cut falls before a user step, so the turn after the target must open with one.
+    const following = providerThreadTurns
+      .filter((turn) => turn.ordinal > target.providerTurn.ordinal)
+      .find(
+        (turn) => turn.nativeTurnRef?.nativeId?.startsWith(`${nativeSessionId}:turn:`) === true,
+      );
+    const outcome =
+      following !== undefined && providerStarted.has(following.id)
+        ? { refusal: "the target is followed by a wake agy cannot cut inside" }
+        : yield* rollbackAntigravityConversationOffThread(options.selfInvocation, {
+            conversationsDir: options.path.join(
+              profileDirectory,
+              ...ANTIGRAVITY_CONVERSATION_SEGMENTS,
+            ),
+            sessionId: nativeSessionId,
+            keepTurns: promptTurns.filter((turn) => turn.ordinal <= target.providerTurn.ordinal)
+              .length,
+            expectedTurns: promptTurns.length,
+            version: options.version === undefined ? undefined : yield* options.version,
+          });
+    if ("sessionId" in outcome) return outcome;
+    yield* Effect.logWarning("agy conversation rollback refused", {
+      reason: outcome.refusal,
       sessionId: nativeSessionId,
-      keepTurns: terminalTurns.filter((turn) => turn.ordinal <= target.providerTurn.ordinal).length,
-      expectedTurns: terminalTurns.length,
-      version: options.version === undefined ? undefined : yield* options.version,
     });
+    return undefined;
   });
 
   return {
@@ -629,6 +663,7 @@ export function makeAntigravityAcpAdapterFlavor(
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
     rollbackSession,
+    recoverContextAfterRefusedRollback: profileDirectory !== undefined,
     buildPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>
       buildAntigravityPrompt({
         input: text,

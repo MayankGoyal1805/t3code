@@ -1111,7 +1111,10 @@ export const layer: Layer.Layer<
               (item) =>
                 item.runId === null ||
                 projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal,
+                  (source) =>
+                    source.id === item.runId &&
+                    source.ordinal < run.ordinal &&
+                    source.status !== "rolled_back",
                 ),
             ),
             createdAt,

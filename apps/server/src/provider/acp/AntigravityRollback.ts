@@ -130,23 +130,25 @@ const executorRowsKept = (database: NodeSqlite.DatabaseSync, cutoff: number) => 
   return kept > 0 && ends[kept - 1] === cutoff - 1 ? kept : undefined;
 };
 
-/** Truncates the copy to the first `keepTurns` user turns; false when the mapping is unsafe. */
+/** Truncates the copy to the first `keepTurns` user turns; the reason when the mapping is unsafe. */
 const truncateCopy = (
   database: NodeSqlite.DatabaseSync,
   keepTurns: number,
   expectedTurns: number,
-) => {
+): string | undefined => {
   // Subagent children are separate databases; only nested trajectories or a child copy are unsafe.
   const isNested =
     scalar(database, "SELECT count(*) AS n FROM steps WHERE has_subtrajectory != 0") > 0 ||
     scalar(database, "SELECT count(*) AS n FROM parent_references") > 0;
-  if (isNested) return false;
+  if (isNested) return "the conversation has nested trajectories";
 
   const userSteps = userStepIndexes(database);
   // T3's terminal turns and agy's user steps must pair one-to-one, or the cut would land on the wrong turn.
-  if (userSteps.length !== expectedTurns) return false;
+  if (userSteps.length !== expectedTurns) {
+    return `agy holds ${userSteps.length} user turns but T3 Code counts ${expectedTurns}`;
+  }
   const cutoff = userSteps[keepTurns];
-  if (cutoff === undefined) return false;
+  if (cutoff === undefined) return `agy has no user turn ${keepTurns + 1} to cut before`;
 
   // Generation metadata must line up one-to-one with planner steps to be cut by position.
   const plannerSteps = scalar(
@@ -154,9 +156,11 @@ const truncateCopy = (
     "SELECT count(*) AS n FROM steps WHERE step_type = ?",
     PLANNER_STEP,
   );
-  if (scalar(database, "SELECT count(*) AS n FROM gen_metadata") !== plannerSteps) return false;
+  if (scalar(database, "SELECT count(*) AS n FROM gen_metadata") !== plannerSteps) {
+    return "generation metadata does not match the planner steps";
+  }
   const keptExecutions = executorRowsKept(database, cutoff);
-  if (keptExecutions === undefined) return false;
+  if (keptExecutions === undefined) return "the cut is not on an execution boundary";
   const keptPlannerSteps = scalar(
     database,
     "SELECT count(*) AS n FROM steps WHERE step_type = ? AND idx < ?",
@@ -169,7 +173,7 @@ const truncateCopy = (
   database.prepare("DELETE FROM gen_metadata WHERE idx >= ?").run(keptPlannerSteps);
   database.prepare("DELETE FROM executor_metadata WHERE idx >= ?").run(keptExecutions);
   database.exec("COMMIT");
-  return true;
+  return undefined;
 };
 
 const removeQuietly = (file: string) => {
@@ -192,56 +196,65 @@ export interface AntigravityRollbackInput {
   readonly newSessionId?: string;
 }
 
-export const rollbackAntigravityConversation = Effect.fn("AntigravityRollback.rollback")(function* (
+export type AntigravityRollbackOutcome =
+  | { readonly sessionId: string }
+  | { readonly refusal: string };
+
+export const attemptAntigravityRollback = Effect.fn("AntigravityRollback.attempt")(function* (
   input: AntigravityRollbackInput,
 ) {
-  if (
-    !isAntigravityRollbackVersionTested(input.version) ||
-    input.keepTurns < 1 ||
-    !SESSION_ID.test(input.sessionId)
-  ) {
-    return undefined;
+  if (!isAntigravityRollbackVersionTested(input.version)) {
+    return { refusal: `agy ${input.version ?? "(unknown version)"} is not a tested version` };
   }
+  if (input.keepTurns < 1) return { refusal: "no earlier turn to keep" };
+  if (!SESSION_ID.test(input.sessionId))
+    return { refusal: "the session id is not a conversation id" };
   const newSessionId = input.newSessionId ?? NodeCrypto.randomUUID();
   if (newSessionId.length !== input.sessionId.length || newSessionId === input.sessionId) {
-    return undefined;
+    return { refusal: "the new session id is not usable" };
   }
   const source = conversationFile(input.conversationsDir, input.sessionId);
   const target = conversationFile(input.conversationsDir, newSessionId);
   const temp = NodePath.join(input.conversationsDir, `.${newSessionId}.rollback`);
 
-  const result = yield* Effect.try({
-    try: () => {
-      if (!NodeFS.existsSync(source) || NodeFS.existsSync(target)) return undefined;
+  const result: AntigravityRollbackOutcome = yield* Effect.try({
+    try: (): AntigravityRollbackOutcome => {
+      if (!NodeFS.existsSync(source)) return { refusal: "the conversation file is missing" };
+      if (NodeFS.existsSync(target)) return { refusal: "the new conversation already exists" };
       removeQuietly(temp);
       withDatabase(source, { readOnly: true }, (database) => {
         database.prepare("VACUUM INTO ?").run(temp);
       });
-      const truncated = withDatabase(temp, {}, (database) => {
-        if (!truncateCopy(database, input.keepTurns, input.expectedTurns)) return false;
+      const refusal = withDatabase(temp, {}, (database) => {
+        const reason = truncateCopy(database, input.keepTurns, input.expectedTurns);
+        if (reason !== undefined) return reason;
         database.exec("BEGIN IMMEDIATE");
         rewriteSessionId(database, input.sessionId, newSessionId);
         database.exec("COMMIT");
-        return true;
+        return undefined;
       });
-      if (!truncated) return undefined;
+      if (refusal !== undefined) return { refusal };
       NodeFS.renameSync(temp, target);
       return { sessionId: newSessionId };
     },
     catch: (cause) => new AntigravityRollbackError({ cause }),
   }).pipe(
-    Effect.tapError((cause) =>
-      Effect.logWarning("agy conversation rollback failed", {
-        cause,
-        sessionId: input.sessionId,
+    Effect.catch((error) =>
+      Effect.succeed<AntigravityRollbackOutcome>({
+        refusal: `the conversation could not be copied: ${String(error.cause)}`,
       }),
     ),
-    Effect.orElseSucceed(() => undefined),
   );
   // Rename moves the temp file; on every other path it is still there.
   removeQuietly(temp);
   return result;
 });
+
+/** The truncated copy's session id, or undefined when the copy would be unsafe. */
+export const rollbackAntigravityConversation = (input: AntigravityRollbackInput) =>
+  attemptAntigravityRollback(input).pipe(
+    Effect.map((outcome) => ("sessionId" in outcome ? outcome : undefined)),
+  );
 
 const decodeRollbackInput = Schema.decodeUnknownSync(
   Schema.fromJsonString(
@@ -258,14 +271,17 @@ const decodeRollbackInput = Schema.decodeUnknownSync(
 
 /** Body of the `__agy-rollback` process: copying a conversation can take seconds on a large database. */
 export const runAntigravityRollbackWorker = async (rawInput: string) => {
-  const result = await Effect.runPromise(
-    rollbackAntigravityConversation(decodeRollbackInput(rawInput)),
-  );
-  process.stdout.write(JSON.stringify(result ?? null));
+  const result = await Effect.runPromise(attemptAntigravityRollback(decodeRollbackInput(rawInput)));
+  process.stdout.write(JSON.stringify(result));
 };
 
 const decodeRollbackResult = Schema.decodeUnknownSync(
-  Schema.fromJsonString(Schema.NullOr(Schema.Struct({ sessionId: Schema.String }))),
+  Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({ sessionId: Schema.String }),
+      Schema.Struct({ refusal: Schema.String }),
+    ]),
+  ),
 );
 
 const ROLLBACK_TIMEOUT_MILLIS = 120_000;
@@ -289,12 +305,14 @@ export const rollbackAntigravityConversationOffThread = Effect.fn(
           },
           (error, output) => (error ? reject(error) : resolve(output)),
         );
-      }).then((output) => decodeRollbackResult(output) ?? undefined),
+      }).then((output) => decodeRollbackResult(output)),
     catch: (cause) => new AntigravityRollbackError({ cause }),
   }).pipe(
     Effect.tapError((cause) =>
       Effect.logWarning("agy conversation rollback process failed", { cause }),
     ),
-    Effect.orElseSucceed(() => undefined),
+    Effect.orElseSucceed((): AntigravityRollbackOutcome => ({
+      refusal: "the rollback process failed",
+    })),
   );
 });

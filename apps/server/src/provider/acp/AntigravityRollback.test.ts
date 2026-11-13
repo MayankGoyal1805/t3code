@@ -7,7 +7,10 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { ProviderTurnId } from "@t3tools/contracts";
+import { makeAntigravityAcpAdapterFlavor } from "../../orchestration-v2/Adapters/AntigravityAdapterV2.ts";
 import {
+  attemptAntigravityRollback,
   isAntigravityRollbackVersionTested,
   rollbackAntigravityConversation,
   rollbackAntigravityConversationOffThread,
@@ -260,9 +263,89 @@ describe("rollbackAntigravityConversation", () => {
         sessionId: NEW_ID,
       });
       assert.equal(readRows(newFile, "SELECT idx FROM steps").length, 10);
-      assert.isUndefined(
+      assert.deepEqual(
         yield* rollbackAntigravityConversationOffThread(invocation, { ...input, keepTurns: 0 }),
+        { refusal: "no earlier turn to keep" },
       );
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+});
+
+describe("rollback of a conversation with wakes", () => {
+  // Turn one, a wake agy ran on its own (a system message, no user step), then turn two.
+  const WAKE_STEPS = [USER, PLANNER, 101, PLANNER, USER, PLANNER];
+  const turn = (ordinal: number, session: string) =>
+    ({
+      id: ProviderTurnId.make(`turn-${ordinal}`),
+      ordinal,
+      status: "completed",
+      nativeTurnRef: { driver: "antigravity", nativeId: `${session}:turn:${ordinal}` },
+    }) as never;
+
+  it.effect("says why it refuses", () =>
+    Effect.gen(function* () {
+      const { directory, sourceFile } = yield* setup;
+      writeConversation(sourceFile);
+      const refusal = yield* attemptAntigravityRollback({
+        conversationsDir: directory,
+        sessionId: OLD_ID,
+        keepTurns: 2,
+        expectedTurns: 5,
+        version: "1.5.8",
+        newSessionId: NEW_ID,
+      });
+      assert.deepEqual(refusal, {
+        refusal: "agy holds 3 user turns but T3 Code counts 5",
+      });
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+
+  it.effect("pairs only the turns that carry a prompt with agy's user steps", () =>
+    Effect.gen(function* () {
+      const { directory, fs } = yield* setup;
+      const path = yield* Path.Path;
+      const profile = path.join(directory, "profile");
+      const conversations = path.join(profile, "antigravity-cli", "conversations");
+      yield* fs.makeDirectory(conversations, { recursive: true });
+      writeConversation(path.join(conversations, `${OLD_ID}.db`), {
+        stepTypes: WAKE_STEPS,
+        executionEnds: [1, 3, 5],
+      });
+      const flavor = makeAntigravityAcpAdapterFlavor({
+        instanceId: "antigravity-rollback-test" as never,
+        selfInvocation: {
+          command: process.execPath,
+          entrypoint: NodeURL.fileURLToPath(new URL("../../bin.ts", import.meta.url)),
+        },
+        makeRuntime: () => Effect.die("unused"),
+        withProcess: () => Effect.die("unused"),
+        defaultModel: Effect.undefined,
+        version: Effect.succeed("1.5.8"),
+        profileDirectory: profile,
+        random: undefined as never,
+        fileSystem: fs,
+        path,
+        host: undefined as never,
+      });
+      const turns = [turn(1, OLD_ID), turn(2, OLD_ID), turn(3, OLD_ID), turn(4, "other")];
+      const input = (target: number) => ({
+        providerThread: undefined as never,
+        target: { type: "provider_turn", providerTurn: turns[target - 1] } as never,
+        providerThreadTurns: turns,
+        providerStartedTurnIds: Effect.succeed(new Set([ProviderTurnId.make("turn-2")])),
+        cwd: directory,
+        nativeSessionId: OLD_ID,
+      });
+
+      // Editing turn two's prompt: the wake before it is kept, and agy's second user step is cut.
+      const kept = yield* flavor.rollbackSession!(input(2));
+      assert.isDefined(kept);
+      assert.equal(
+        readRows(path.join(conversations, `${kept!.sessionId}.db`), "SELECT idx FROM steps").length,
+        4,
+      );
+      // The wake after turn one would have to be cut from inside, which agy has no step for.
+      assert.isUndefined(yield* flavor.rollbackSession!(input(1)));
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 });
