@@ -797,6 +797,19 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
     assert.equal(text(follower.incoming(chunk("After the tool."))), "After the tool.");
   });
 
+  it("leaves a timer-style wake to the subagent tracker while its report is still due", () => {
+    const follower = launched({ id: "call_x", name: "invoke_subagent", args: {} });
+    assert.deepEqual(
+      follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 6 }), true),
+      {
+        updates: [],
+      },
+    );
+    assert.isFalse(follower.wakeInProgress());
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 8 }));
+    assert.isTrue(follower.wakeInProgress());
+  });
+
   it("announces a wake's write_file as a file change, like the live path", () => {
     const follower = launched({ id: "call_1", args: ONE });
     const WRITE = { Content: "2\n", Overwrite: true, Path: "/tmp/agy-goal-test/g2.txt" };

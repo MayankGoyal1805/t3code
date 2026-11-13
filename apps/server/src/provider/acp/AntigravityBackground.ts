@@ -660,7 +660,8 @@ export function makeAntigravityBackgroundFollower() {
         .map((t) => t.toolCallId);
     },
 
-    hook(event: AntigravityHookEvent): AntigravityBackgroundStep {
+    /** `subagentPending`: a launched subagent's report is still due in the open turn, which owns that wake. */
+    hook(event: AntigravityHookEvent, subagentPending = false): AntigravityBackgroundStep {
       if (sessionId === undefined || event.conversationId !== sessionId) return { updates: [] };
       if (event.transcriptPath !== undefined) transcriptPath = event.transcriptPath;
       const read = transcriptPath === undefined ? undefined : { transcriptPath };
@@ -706,7 +707,7 @@ export function makeAntigravityBackgroundFollower() {
           if (promptInFlight) return { updates: [] };
           if (wake === undefined) {
             // Not caused by a finished tool: a timer fired. Each such invocation starts at 0.
-            if (event.invocationNum !== 0) return { updates: [] };
+            if (event.invocationNum !== 0 || subagentPending) return { updates: [] };
             wake = newWake();
             wake.from = event.initialNumSteps ?? 0;
             return read === undefined ? { updates: [] } : { updates: [], read };
