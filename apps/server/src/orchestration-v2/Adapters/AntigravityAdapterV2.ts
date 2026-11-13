@@ -459,24 +459,29 @@ function followBackgroundWork(
         }
         return yield* runtime.handleSessionUpdate((notification) =>
           Effect.suspend(() => {
-            const { update } = notification;
             if (notification.sessionId !== rootSessionId) return handler(notification);
-            // The next prompt makes agy stream the wake it already reported through its hooks.
-            if (follower.isReplay(update)) return Effect.void;
-            if (
-              (update.sessionUpdate === "tool_call" ||
-                update.sessionUpdate === "tool_call_update") &&
-              isAntigravityBackgroundToolName(update.name)
-            ) {
-              follower.toolObserved({
-                toolCallId: update.toolCallId,
-                name: update.name,
-                rawInput: update.rawInput,
-                status:
-                  update.status === "completed" || update.status === "failed" ? "settled" : "open",
-              });
-            }
-            return handler(notification);
+            return Effect.forEach(
+              follower.incoming(notification.update),
+              (update) => {
+                if (
+                  (update.sessionUpdate === "tool_call" ||
+                    update.sessionUpdate === "tool_call_update") &&
+                  isAntigravityBackgroundToolName(update.name)
+                ) {
+                  follower.toolObserved({
+                    toolCallId: update.toolCallId,
+                    name: update.name,
+                    rawInput: update.rawInput,
+                    status:
+                      update.status === "completed" || update.status === "failed"
+                        ? "settled"
+                        : "open",
+                  });
+                }
+                return handler({ ...notification, update });
+              },
+              { discard: true },
+            );
           }),
         );
       },
@@ -490,6 +495,7 @@ function followBackgroundWork(
             : send(follower.failUnconfirmed("The command was interrupted.")),
         ),
         Effect.tapError(() => send(follower.failUnconfirmed("The turn failed."))),
+        Effect.ensuring(Effect.suspend(() => send(follower.flush()))),
         Effect.ensuring(Effect.sync(() => follower.promptReturned())),
       ),
     cancel: Effect.suspend(() => send(follower.abandon())).pipe(Effect.andThen(runtime.cancel)),

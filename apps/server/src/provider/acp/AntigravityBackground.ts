@@ -1,6 +1,7 @@
 import type * as EffectAcpSchema from "effect-acp/compat";
 
 import type { AntigravityHookEvent } from "./AntigravityHookEvents.ts";
+import { antigravityToolPresentation } from "./AntigravityProtocol.ts";
 import type { AntigravityTranscriptStep } from "./AntigravityTranscript.ts";
 
 /**
@@ -17,8 +18,19 @@ const BACKGROUND_TOOLS: ReadonlySet<string> = new Set(["run_command", "schedule"
 export const isAntigravityBackgroundToolName = (name: unknown): name is string =>
   typeof name === "string" && BACKGROUND_TOOLS.has(name);
 
-const GOAL_COMPLETE_MARKER = /\s*<!--\s*GOAL_COMPLETE\s*-->\s*$/;
-const stripAntigravityGoalMarker = (text: string) => text.replace(GOAL_COMPLETE_MARKER, "");
+const GOAL_COMPLETE = "<!-- GOAL_COMPLETE -->";
+const GOAL_COMPLETE_MARKER = /\s*<!--\s*GOAL_COMPLETE\s*-->/g;
+const stripAntigravityGoalMarker = (text: string) =>
+  text.replace(GOAL_COMPLETE_MARKER, "").trimEnd();
+
+/** The end of `text` that could still grow into the goal marker, with the whitespace before it. */
+const goalMarkerPrefixStart = (text: string) => {
+  const open = text.lastIndexOf("<");
+  if (open < 0 || !GOAL_COMPLETE.startsWith(text.slice(open))) return text.length;
+  let start = open;
+  while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+  return start;
+};
 
 type SessionUpdate = EffectAcpSchema.SessionUpdate;
 
@@ -44,12 +56,13 @@ export interface AntigravityToolObservation {
   readonly status: "open" | "settled";
 }
 
+type ToolPresentation = ReturnType<typeof antigravityToolPresentation>;
+
 interface TrackedTool {
   toolCallId: string;
   readonly name: string;
   readonly args: unknown;
-  readonly title: string;
-  readonly kind: "execute" | "other";
+  readonly presentation: ToolPresentation;
   synthetic: boolean;
   background: boolean;
   done: boolean;
@@ -104,13 +117,6 @@ const canonical = (value: unknown): string =>
 const asRecord = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 
-const toolDescription = (name: string, args: unknown) => {
-  const commandLine = asRecord(args).CommandLine;
-  return typeof commandLine === "string" && commandLine.trim().length > 0
-    ? ({ title: commandLine.trim(), kind: "execute" } as const)
-    : ({ title: `Run ${name}`, kind: "other" } as const);
-};
-
 const TASK_SENDER = /\bsender=\S*?\/task-(\d+)\b/;
 const EXIT_CODE = /Command exited with code (-?\d+)\./;
 
@@ -157,6 +163,11 @@ export function makeAntigravityBackgroundFollower() {
   let replayMatch: string | undefined;
   /** The replay comes first at a prompt; anything else it streams is the prompt's own. */
   let replayOpen = false;
+  /** The end of a live reply that may be the start of the goal marker, held until it is known. */
+  let heldText = "";
+  /** The tail of the live text shown since the last tool call, for the break before agy's next response. */
+  let liveTail: string | undefined;
+  let invocationBegan = false;
   let pendingCompletions: Array<{
     readonly tool: TrackedTool;
     readonly error: string | null | undefined;
@@ -172,7 +183,7 @@ export function makeAntigravityBackgroundFollower() {
     promptInFlight ? {} : { _meta: { [ANTIGRAVITY_WAKE_META]: true } };
 
   const toolUpdate = (
-    tool: Pick<TrackedTool, "toolCallId" | "name" | "args" | "title" | "kind">,
+    tool: Pick<TrackedTool, "toolCallId" | "name" | "args" | "presentation">,
     fields: {
       readonly status: "in_progress" | "completed" | "failed";
       readonly rawOutput?: unknown;
@@ -183,8 +194,7 @@ export function makeAntigravityBackgroundFollower() {
       sessionUpdate,
       toolCallId: tool.toolCallId,
       name: tool.name,
-      title: tool.title,
-      kind: tool.kind,
+      ...tool.presentation,
       rawInput: tool.args,
       ...fields,
       ...tag(),
@@ -192,15 +202,17 @@ export function makeAntigravityBackgroundFollower() {
 
   const outputFor = (tool: TrackedTool, error: string | null | undefined) => {
     const message = tool.stepIdx === undefined ? undefined : knownMessages.get(tool.stepIdx);
-    const exitCode = message?.exitCode;
     const failed =
-      (error !== undefined && error !== null && error.length > 0) || (exitCode ?? 0) !== 0;
+      (error !== undefined && error !== null && error.length > 0) || (message?.exitCode ?? 0) !== 0;
+    // A command that ended without an error succeeded, until its wake message says otherwise.
+    const exitCode = message?.exitCode ?? (failed ? undefined : 0);
     if (tool.name === "run_command") {
       const output =
         message?.output ?? taskOutputs.get(tool.toolCallId) ?? (error ? error : undefined);
       return {
         failed,
         message,
+        exitCode,
         output,
         rawOutput:
           output === undefined && exitCode === undefined
@@ -214,14 +226,15 @@ export function makeAntigravityBackgroundFollower() {
     return {
       failed,
       message,
+      exitCode: undefined,
       output: undefined,
       rawOutput: failed && error ? error : "Timer elapsed.",
     };
   };
 
   const complete = (tool: TrackedTool, error: string | null | undefined): SessionUpdate => {
-    const { failed, message, output, rawOutput } = outputFor(tool, error);
-    tool.delivered = { exitCode: message?.exitCode, output, fromMessage: message !== undefined };
+    const { failed, message, exitCode, output, rawOutput } = outputFor(tool, error);
+    tool.delivered = { exitCode, output, fromMessage: message !== undefined };
     reported.add(tool.toolCallId);
     return toolUpdate(
       tool,
@@ -247,13 +260,11 @@ export function makeAntigravityBackgroundFollower() {
     readonly started: boolean;
     readonly synthetic?: boolean;
   }) => {
-    const description = toolDescription(input.name, input.args);
     const tool: TrackedTool = {
       toolCallId: input.toolCallId,
       name: input.name,
       args: input.args,
-      title: description.title,
-      kind: description.kind,
+      presentation: antigravityToolPresentation(input.name, input.args),
       background: input.background,
       done: false,
       stepIdx: undefined,
@@ -307,7 +318,7 @@ export function makeAntigravityBackgroundFollower() {
       const message = tool.stepIdx === undefined ? undefined : knownMessages.get(tool.stepIdx);
       if (message === undefined) continue;
       if (
-        (message.exitCode ?? 0) === (tool.delivered.exitCode ?? 0) &&
+        (message.exitCode === undefined || message.exitCode === tool.delivered.exitCode) &&
         (message.output === undefined || message.output === tool.delivered.output)
       ) {
         tool.delivered.fromMessage = true;
@@ -460,6 +471,9 @@ export function makeAntigravityBackgroundFollower() {
       shownTexts = [];
       replayMatch = undefined;
       replayOpen = false;
+      heldText = "";
+      liveTail = undefined;
+      invocationBegan = false;
       taskOutputs.clear();
       knownMessages.clear();
     },
@@ -487,6 +501,9 @@ export function makeAntigravityBackgroundFollower() {
       promptInFlight = true;
       busyStopDuringPrompt = false;
       wake = undefined;
+      heldText = "";
+      liveTail = undefined;
+      invocationBegan = false;
       replayMatch = undefined;
       replayOpen = shownTexts.length > 0 || shownCalls.some((call) => !call.matched);
     },
@@ -518,6 +535,45 @@ export function makeAntigravityBackgroundFollower() {
       replayOpen = false;
       replayMatch = undefined;
       return false;
+    },
+
+    /**
+     * What the prompt streams, ready to show: a wake T3 Code already showed is dropped, the goal
+     * marker is cut, and a new response of agy's is set apart from the one before it.
+     */
+    incoming(update: SessionUpdate): ReadonlyArray<SessionUpdate> {
+      if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+        const joined = (heldText + update.content.text).replace(GOAL_COMPLETE_MARKER, "");
+        const start = goalMarkerPrefixStart(joined);
+        heldText = joined.slice(start);
+        const text = joined.slice(0, start);
+        if (text.length === 0) return [];
+        if (this.isReplay({ ...update, content: { ...update.content, text } })) return [];
+        const newlines =
+          (/\n*$/.exec(liveTail ?? "")?.[0].length ?? 0) + (/^\n*/.exec(text)?.[0].length ?? 0);
+        const gap =
+          invocationBegan && liveTail !== undefined && liveTail.length > 0
+            ? "\n".repeat(Math.max(0, 2 - newlines))
+            : "";
+        invocationBegan = false;
+        liveTail = `${gap}${text}`.slice(-2);
+        return [{ ...update, content: { ...update.content, text: `${gap}${text}` } }];
+      }
+      const flushed = this.flush();
+      if (this.isReplay(update)) return flushed;
+      if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+        liveTail = undefined;
+      }
+      return [...flushed, update];
+    },
+
+    /** Text that only looked like the start of the goal marker. */
+    flush(): ReadonlyArray<SessionUpdate> {
+      if (heldText.length === 0) return [];
+      const text = heldText;
+      heldText = "";
+      liveTail = text.slice(-2);
+      return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }];
     },
 
     promptReturned() {
@@ -646,7 +702,15 @@ export function makeAntigravityBackgroundFollower() {
           };
         }
         case "PreInvocation": {
-          if (promptInFlight || wake === undefined) return { updates: [] };
+          invocationBegan = true;
+          if (promptInFlight) return { updates: [] };
+          if (wake === undefined) {
+            // Not caused by a finished tool: a timer fired. Each such invocation starts at 0.
+            if (event.invocationNum !== 0) return { updates: [] };
+            wake = newWake();
+            wake.from = event.initialNumSteps ?? 0;
+            return read === undefined ? { updates: [] } : { updates: [], read };
+          }
           if (wake.stopped) {
             // The next wake begins before the last one's follow-up was ever read.
             const updates = closeWake();

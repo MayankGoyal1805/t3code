@@ -177,7 +177,10 @@ describe("AntigravityBackgroundFollower", () => {
       taskLog: { toolCallId: "call_1", text: "ONE\r\n" },
     });
     assert.deepEqual(summarize(updates), [["tool_call_update", "call_1", "completed"]]);
-    assert.deepEqual((updates[0] as { rawOutput?: unknown }).rawOutput, { combinedOutput: "ONE" });
+    assert.deepEqual((updates[0] as { rawOutput?: unknown }).rawOutput, {
+      combinedOutput: "ONE",
+      exitCode: 0,
+    });
     assert.isTrue(updates.every(isWake));
     assert.isTrue(follower.wakeInProgress());
   });
@@ -687,6 +690,141 @@ describe("AntigravityBackgroundFollower with two tasks after an earlier wake", (
     assert.isTrue(follower.isReplay(chunk("Waiting.")));
     // A command the user's new prompt runs is not a replay, even with the same text.
     assert.isFalse(follower.isReplay({ ...replay, toolCallId: "call_new" }));
+  });
+
+  // Steps 103 to 111 of a real transcript: a recurring cron whose ticks end in no PostToolUse.
+  it("shows each tick of a recurring schedule as a wake, and keeps the card running", () => {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    const CRON = {
+      CronExpression: "* * * * *",
+      ExactTiming: false,
+      IsDaemon: true,
+      Prompt: "TOCK",
+    };
+    follower.toolObserved({
+      toolCallId: "call_cron",
+      name: "schedule",
+      rawInput: CRON,
+      status: "open",
+    });
+    follower.hook(hook("Stop", { fullyIdle: false }));
+    follower.promptReturned();
+    const tick = (index: number, text: string) => [
+      {
+        step_index: index,
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        content: systemMessage(`${ROOT}/task-104`, `Reply with just TOCK (iteration ${index})`),
+      },
+      { step_index: index + 1, type: "PLANNER_RESPONSE", status: "DONE", content: text },
+    ];
+    const first = transcript(launchSteps, tick(106, "TOCK 1"));
+    assert.deepEqual(feed(follower, preInvocation(106), first), []);
+    assert.isTrue(follower.wakeInProgress());
+    const shown = feed(follower, hook("Stop", { fullyIdle: true }), first);
+    assert.deepEqual(summarize(shown), [["agent_message_chunk", "TOCK 1", null]]);
+    assert.isTrue(shown.every(isWake));
+    assert.isFalse(follower.wakeInProgress());
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_cron"]);
+
+    const second = transcript(launchSteps, tick(106, "TOCK 1"), tick(108, "TOCK 2"));
+    feed(follower, preInvocation(108), second);
+    assert.deepEqual(summarize(feed(follower, hook("Stop", { fullyIdle: true }), second)), [
+      ["agent_message_chunk", "TOCK 2", null],
+    ]);
+
+    follower.promptStarted();
+    assert.deepEqual(follower.incoming(chunk("TOCK 1")), []);
+    assert.deepEqual(follower.incoming(chunk("TOCK 2")), []);
+    assert.deepEqual(follower.pendingToolCallIds(), ["call_cron"]);
+  });
+
+  // Step 135 of a real transcript ends with the goal marker; agy streams it again at the next prompt.
+  it("cuts the goal marker, and does not show a delivered wake's reply again because of it", () => {
+    const follower = afterFirstWake();
+    const reply = "Created all three files.\n\n- g1.txt\n\n<!-- GOAL_COMPLETE -->";
+    const steps = transcript(priorWake, [
+      { step_index: 11, type: "SYSTEM_MESSAGE", status: "DONE", content: finished(8, "ONE") },
+      { step_index: 12, type: "PLANNER_RESPONSE", status: "DONE", content: reply },
+    ]);
+    feed(follower, postToolUse(8, ONE), steps, "ONE");
+    feed(follower, preInvocation(11), steps);
+    const shown = feed(follower, hook("Stop", { fullyIdle: false }), steps);
+    assert.deepEqual(summarize(shown), [
+      ["agent_message_chunk", "Created all three files.\n\n- g1.txt", null],
+    ]);
+
+    follower.promptStarted();
+    assert.deepEqual(follower.incoming(chunk(reply)), []);
+  });
+
+  it("cuts the goal marker from a live reply even when it arrives in pieces", () => {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    const texts = (updates: ReadonlyArray<object>) => summarize(updates).map((entry) => entry[1]);
+    assert.deepEqual(texts(follower.incoming(chunk("All done.\n\n<!-- GOAL_COMP"))), ["All done."]);
+    assert.deepEqual(follower.incoming(chunk("LETE -->")), []);
+    assert.deepEqual(follower.flush(), []);
+    // Text that only looked like the start of the marker is not lost.
+    assert.deepEqual(texts(follower.incoming(chunk("a <!-"))), ["a"]);
+    assert.deepEqual(texts(follower.flush()), [" <!-"]);
+  });
+
+  it("sets each new response of agy's apart from the one before it", () => {
+    const follower = makeAntigravityBackgroundFollower();
+    follower.sessionStarted(ROOT);
+    follower.promptStarted();
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 0 }));
+    const text = (updates: ReadonlyArray<object>) => summarize(updates)[0]?.[1];
+    assert.equal(text(follower.incoming(chunk("Started."))), "Started.");
+    assert.equal(text(follower.incoming(chunk(" Waiting."))), " Waiting.");
+    // The command ended while the prompt was still open: agy answers again.
+    follower.hook(hook("PreInvocation", { invocationNum: 0, initialNumSteps: 5 }));
+    assert.equal(text(follower.incoming(chunk("task-78 finished"))), "\n\ntask-78 finished");
+    follower.hook(hook("PreInvocation", { invocationNum: 1, initialNumSteps: 7 }));
+    assert.equal(text(follower.incoming(chunk("\nMore."))), "\n\nMore.");
+    // A tool call between two responses already splits them.
+    follower.incoming({
+      sessionUpdate: "tool_call",
+      toolCallId: "t",
+      title: "t",
+      status: "completed",
+    });
+    follower.hook(hook("PreInvocation", { invocationNum: 2, initialNumSteps: 9 }));
+    assert.equal(text(follower.incoming(chunk("After the tool."))), "After the tool.");
+  });
+
+  it("announces a wake's write_file as a file change, like the live path", () => {
+    const follower = launched({ id: "call_1", args: ONE });
+    const WRITE = { Content: "2\n", Overwrite: true, Path: "/tmp/agy-goal-test/g2.txt" };
+    const decided = {
+      step_index: 6,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      tool_calls: [{ name: "write_file", args: WRITE }],
+    };
+    feed(follower, postToolUse(2, ONE, "run_command", "call_1"), [], "ONE");
+    feed(follower, preInvocation(5), transcript(launchSteps, firstWake.slice(0, 1)));
+    const started = feed(
+      follower,
+      hook("PreToolUse", {
+        stepIdx: 7,
+        toolCall: { name: "write_file", args: WRITE, id: "call_w" },
+      }),
+      transcript(launchSteps, [firstWake[0]!, decided]),
+    );
+    assert.deepEqual(summarize(started), [["tool_call", "call_w", "in_progress"]]);
+    assert.include(started[0] as object, {
+      kind: "edit",
+      title: "File g2.txt",
+    });
+    assert.deepEqual((started[0] as { locations?: unknown }).locations, [{ path: WRITE.Path }]);
+    assert.deepEqual((started[0] as { content?: unknown }).content, [
+      { type: "diff", path: WRITE.Path, newText: "2\n" },
+    ]);
   });
 });
 

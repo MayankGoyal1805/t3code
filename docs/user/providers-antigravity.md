@@ -95,8 +95,9 @@ See [agent work](./thread-sidebar.md#inspect-agent-work) for where to inspect ac
 
 When Antigravity starts a command in the background or sets a timer (`/schedule`), the card keeps
 running after the turn ends. When the task finishes, the card completes with its output and the
-agent's follow-up appears in the thread as a new run, without you sending anything. Ending a turn
-with **Stop** drops tasks it was following.
+agent's follow-up appears in the thread as a new run, without you sending anything. A recurring
+schedule starts a new run for each tick until the agent cancels it. Antigravity offers no way to
+stop a task from outside, so **Stop** does not end a running task: ask the agent to cancel it.
 
 To hear about these, T3 Code adds a `t3-code` entry to `config/hooks.json` in the instance's Gemini
 directory. For the default instance that is `~/.gemini/config/hooks.json`, which the `agy` CLI

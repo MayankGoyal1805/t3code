@@ -145,8 +145,9 @@ profile's `config/hooks.json` whose one-line command appends each hook payload t
 [follower](../../apps/server/src/provider/acp/AntigravityBackground.ts) turns those events plus the
 transcript the hook points at (the content source, plain JSONL) into synthetic ACP updates marked
 as wakes, so the shared adapter's post-settle continuation path starts the new run. A wake is a
-`PreInvocation` with no prompt in flight after a background task's `PostToolUse`; that is what
-separates it from a subagent wake, which the session-log tracker owns. Background tasks pin the
+`PreInvocation` with no prompt in flight, after a background task's `PostToolUse` or, for a timer
+tick that ends no task, with `invocationNum` 0; that is what separates it from a subagent wake,
+which the session-log tracker owns. Background tasks pin the
 session but never hold the turn open. The wake streams live: the card completes at `PostToolUse`
 (output from the task log, which exists before the transcript has it), and each later hook
 (`PreToolUse`, `PreInvocation`, `Stop`) triggers a transcript read that delivers new text and tools
