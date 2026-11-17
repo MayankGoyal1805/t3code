@@ -681,6 +681,9 @@ export function makeAntigravityAcpAdapterFlavor(
       ? {
           enablePostSettleContinuation: true,
           wakeNotificationsAreComplete: true,
+          // agy has no call that ends a background task, so Stop ends its process tree instead.
+          restartRuntimeAfterInterrupt: true,
+          terminateRuntimeProcessGroupOnInterrupt: true,
           // Commands and timers outlive the turn: they pin the session but never hold the run open.
           extractBackgroundTaskId: (toolCall) =>
             backgroundHooksLive && isAntigravityBackgroundToolName(toolCall.data.name)

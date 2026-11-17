@@ -237,6 +237,10 @@ export const AntigravityDriver: ProviderDriver<
         authMethod: auth.authMethod,
         runtimeVersion,
         childProcessSpawner: spawner,
+        // Stop ends the commands and timers agy leaves running, which only its process tree can reach.
+        ownDetachedProcessGroup: true,
+        ownDescendantProcessGroups: platform === "linux",
+        processGroupPlatform: platform,
         spawn: buildAntigravityAcpSpawnInput({
           executablePath: settings.binaryPath,
           geminiDirectoryArgs,
