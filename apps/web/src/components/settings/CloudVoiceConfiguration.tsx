@@ -14,6 +14,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthSettingsWriteScope,
   CloudSpeechApiKey,
+  CloudSpeechEndpoint,
   CloudSpeechModelId,
   CLOUD_SPEECH_LABELS,
   CLOUD_SPEECH_PROVIDER_NAMES,
@@ -83,6 +84,7 @@ function useCloudRead<A, E>(
 }
 const isApiKey = Schema.is(CloudSpeechApiKey);
 const isModelId = Schema.is(CloudSpeechModelId);
+const isEndpoint = Schema.is(CloudSpeechEndpoint);
 type CloudDestination = Extract<VoiceTranscriptionDestination, { kind: "cloud" }>;
 
 function ModelPicker({
@@ -220,17 +222,35 @@ export function CloudVoiceConfiguration({
       ? { kind: "cloud", provider: "openrouter", environmentId: id, model }
       : { kind: "cloud", provider: provider as "openai" | "xai", environmentId: id };
   const enable = () => chooseAudioDestination(destination());
+  const savedEndpoint = AsyncResult.isSuccess(presence)
+    ? presence.value?.openaiEndpoint
+    : undefined;
+  const [endpointDraft, setEndpointDraft] = useState<{ baseUrl: string; model: string } | null>(
+    null,
+  );
+  const raw = endpointDraft ?? savedEndpoint ?? { baseUrl: "", model: "" };
+  const endpoint = { baseUrl: raw.baseUrl.trim(), model: raw.model.trim() };
+  const endpointShown = provider === "openai" && editingKey && savedEndpoint !== undefined;
+  const endpointChanged =
+    endpointShown &&
+    (endpoint.baseUrl !== savedEndpoint.baseUrl || endpoint.model !== savedEndpoint.model);
+  const endpointValid = !endpointShown || isEndpoint(endpoint);
   const canSubmit = routed
     ? modelChosen && keyReady && (!active || modelChanged || keyChanged)
-    : credential !== undefined;
+    : endpointValid &&
+      (draft.trim() ? credential !== undefined : Boolean(saved) && endpointChanged);
 
-  const saveKey = async (value: SettingsSecretValue | null, thenEnable: boolean) => {
+  const saveKey = async (
+    value: SettingsSecretValue | null | undefined,
+    thenEnable: boolean,
+    nextEndpoint?: CloudSpeechEndpoint,
+  ) => {
     if (!connected || !canManage || busy) return;
     setError("");
     setBusy(true);
     try {
       const commit = thenEnable ? pendingCloudAudioChoice(destination()) : null;
-      await runEnvironmentSpeech(setCloudSpeechKey(prepared, provider, value));
+      await runEnvironmentSpeech(setCloudSpeechKey(prepared, provider, value, nextEndpoint));
       refresh();
       commit?.();
       close();
@@ -242,8 +262,9 @@ export function CloudVoiceConfiguration({
   const submit = () => {
     if (!canSubmit || busy) return;
     const grantChanges = !active || modelChanged;
-    if (credential !== undefined && (!routed || keyChanged))
-      return void saveKey(credential, grantChanges);
+    if (!routed)
+      return void saveKey(credential, grantChanges, endpointChanged ? endpoint : undefined);
+    if (credential !== undefined && keyChanged) return void saveKey(credential, grantChanges);
     // Model-only changes never write to the environment.
     if (grantChanges) enable();
     close();
@@ -400,6 +421,38 @@ export function CloudVoiceConfiguration({
                 }}
               >
                 {keyField}
+                {endpointShown && (
+                  <>
+                    <Label htmlFor="voice-cloud-base-url">Base URL</Label>
+                    <Input
+                      id="voice-cloud-base-url"
+                      placeholder="https://api.openai.com/v1"
+                      value={raw.baseUrl}
+                      disabled={busy}
+                      autoComplete="off"
+                      spellCheck={false}
+                      inputMode="url"
+                      onChange={(event) =>
+                        setEndpointDraft({ ...raw, baseUrl: event.target.value })
+                      }
+                    />
+                    <Label htmlFor="voice-cloud-model-override">Model</Label>
+                    <Input
+                      id="voice-cloud-model-override"
+                      placeholder="gpt-transcribe"
+                      value={raw.model}
+                      disabled={busy}
+                      autoComplete="off"
+                      spellCheck={false}
+                      onChange={(event) => setEndpointDraft({ ...raw, model: event.target.value })}
+                    />
+                    <p className="text-sm text-muted-foreground">
+                      {endpointValid
+                        ? "Leave empty for OpenAI. Set both to use an OpenAI-compatible server."
+                        : "Enter an http:// or https:// URL without credentials, and a model name without spaces."}
+                    </p>
+                  </>
+                )}
               </form>
             ) : !saved ? (
               <p>Ask an administrator on {environment.label} to add an API key.</p>
@@ -450,7 +503,7 @@ export function CloudVoiceConfiguration({
                 </Button>
               ) : null
             ) : editingKey ? (
-              <Button type="submit" form={formId} size="sm" disabled={busy || !credential}>
+              <Button type="submit" form={formId} size="sm" disabled={busy || !canSubmit}>
                 {active ? "Save key" : "Save and enable"}
               </Button>
             ) : saved && !active ? (

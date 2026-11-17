@@ -83,7 +83,11 @@ export const speechHttpApiLayer = HttpApiBuilder.group(
         "cloudKeys",
         Effect.fn("environment.voice.cloudKeys")(function* (args) {
           yield* guard(args.endpoint.name);
-          return yield* cloud.configured.pipe(
+          return yield* Effect.all({
+            keys: cloud.configured,
+            openaiEndpoint: cloud.openAiEndpoint,
+          }).pipe(
+            Effect.map(({ keys, openaiEndpoint }) => ({ ...keys, openaiEndpoint })),
             Effect.catch((error) => failEnvironmentInternal("internal_error", error)),
           );
         }),
@@ -93,7 +97,7 @@ export const speechHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.setCloudKey")(function* (args) {
           yield* guard(args.endpoint.name, AuthSettingsWriteScope);
           yield* cloud
-            .setKey(args.params.provider, args.payload.key)
+            .setKey(args.params.provider, args.payload.key, args.payload.endpoint)
             .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
         }),
       )

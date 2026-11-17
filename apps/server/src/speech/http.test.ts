@@ -147,6 +147,7 @@ effectIt.effect(
       const transcribe = vi.fn();
       const cloud = Layer.mock(CloudSpeech.CloudSpeech)({
         configured: Effect.sync(() => ({ openai: stored, xai: false })),
+        openAiEndpoint: Effect.succeed({ baseUrl: "", model: "" }),
         models: Effect.succeed([{ id: "acme/transcribe-1", name: "Acme Transcribe" }]),
         setKey: (provider, key) =>
           Effect.sync(() => {
@@ -214,6 +215,7 @@ effectIt.effect(
       expect(yield* Effect.promise(() => keys.json())).toEqual({
         openai: true,
         xai: false,
+        openaiEndpoint: { baseUrl: "", model: "" },
       });
       const setReference = (key: unknown) =>
         call("xai/key", {

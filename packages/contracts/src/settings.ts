@@ -53,7 +53,9 @@ import {
 } from "./providerInstance.ts";
 import { PullRequestMergeMethod } from "./pullRequest.ts";
 import {
+  CloudSpeechBaseUrl,
   CloudSpeechModelId,
+  CloudSpeechModelOverride,
   SpeechAcceleration,
   SpeechCorrectionCue,
   SpeechCustomWords,
@@ -1387,6 +1389,11 @@ export const ServerSettings = Schema.Struct({
   cloudSpeechCredentials: CloudSpeechCredentials.pipe(
     Schema.withDecodingDefault(Effect.succeed({ openai: "", xai: "", openrouter: "" })),
   ),
+  // Empty fields use OpenAI and its default model. The saved key is sent to this URL.
+  cloudSpeechOpenAiEndpoint: Schema.Struct({
+    baseUrl: CloudSpeechBaseUrl.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+    model: CloudSpeechModelOverride.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  }).pipe(Schema.withDecodingDefault(Effect.succeed({ baseUrl: "", model: "" }))),
   speechModelId: Schema.String.pipe(
     Schema.withDecodingDefault(Effect.succeed("handy-computer/parakeet-unified-en-0.6b-gguf")),
   ),
@@ -1835,6 +1842,12 @@ export const ServerSettingsPatch = Schema.Struct({
       openai: Schema.optionalKey(SettingsSecretValue),
       xai: Schema.optionalKey(SettingsSecretValue),
       openrouter: Schema.optionalKey(SettingsSecretValue),
+    }),
+  ),
+  cloudSpeechOpenAiEndpoint: Schema.optionalKey(
+    Schema.Struct({
+      baseUrl: Schema.optionalKey(CloudSpeechBaseUrl),
+      model: Schema.optionalKey(CloudSpeechModelOverride),
     }),
   ),
   speechModelId: Schema.optionalKey(Schema.String),

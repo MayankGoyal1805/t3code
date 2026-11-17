@@ -1,12 +1,33 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 
 export const CloudSpeechApiKey = TrimmedNonEmptyString.check(
   Schema.isMaxLength(4096),
   Schema.isPattern(/^(?![a-z][a-z\d+.-]*:\/\/)[!-~]+$/i),
 );
+
+const isHttpBaseUrl = Schema.makeFilter((value: string) => {
+  if (value === "") return true;
+  if (!URL.canParse(value)) return "Enter an absolute http:// or https:// URL.";
+  const url = new URL(value);
+  return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password
+    ? true
+    : "Enter an http:// or https:// URL without credentials.";
+});
+/** Empty uses OpenAI. Otherwise requests go to `<baseUrl>/audio/transcriptions`. */
+export const CloudSpeechBaseUrl = TrimmedString.check(Schema.isMaxLength(2048), isHttpBaseUrl);
+export const CloudSpeechModelOverride = TrimmedString.check(
+  Schema.isMaxLength(160),
+  Schema.isPattern(/^[!-~]*$/),
+);
+export const CloudSpeechEndpoint = Schema.Struct({
+  baseUrl: CloudSpeechBaseUrl,
+  model: CloudSpeechModelOverride,
+});
+export type CloudSpeechEndpoint = typeof CloudSpeechEndpoint.Type;
+export const normalizeCloudSpeechBaseUrl = (baseUrl: string) => baseUrl.replace(/\/+$/, "");
 
 export const CloudSpeechProvider = Schema.Literals(["openai", "xai", "openrouter"]);
 export type CloudSpeechProvider = typeof CloudSpeechProvider.Type;
@@ -25,6 +46,8 @@ export const CloudSpeechKeys = Schema.Struct({
   openai: Schema.Boolean,
   xai: Schema.Boolean,
   openrouter: Schema.optionalKey(Schema.Boolean),
+  /** Present on servers that support an OpenAI-compatible endpoint override. */
+  openaiEndpoint: Schema.optionalKey(CloudSpeechEndpoint),
 });
 export type CloudSpeechKeys = typeof CloudSpeechKeys.Type;
 

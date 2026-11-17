@@ -96,6 +96,61 @@ it.effect.each(["openai", "xai"] as const)("sends only to %s using its own saved
   }),
 );
 
+it.effect("sends OpenAI dictation to a configured server with classic Whisper fields", () =>
+  Effect.gen(function* () {
+    const upstream = vi.fn<typeof fetch>(async () => Response.json({ text: "hello" }));
+    const service = yield* CloudSpeech.CloudSpeech.pipe(
+      Effect.provide(
+        CloudSpeech.layer.pipe(
+          Layer.provide(FetchHttpClient.layer),
+          Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
+          Layer.provide(Layer.mock(SecretResolver.SecretResolver)({})),
+        ),
+      ),
+    );
+    const transcribe = () =>
+      service
+        .transcribe("openai", new Uint8Array(new Float32Array([0, 0.5]).buffer), {
+          ...DEFAULT_SPEECH_TRANSCRIPTION_OPTIONS,
+          speechLanguage: "en",
+          speechCustomWords: [
+            { term: "T3 Code", aliases: [] },
+            { term: "a<b", aliases: [] },
+            { term: "Effect", aliases: [] },
+          ],
+        })
+        .pipe(Effect.provideService(FetchHttpClient.Fetch, upstream));
+    yield* service.setKey("openai", Redacted.make("chosen"), {
+      baseUrl: "http://127.0.0.1:2048/v1//",
+      model: "whisper-1",
+    });
+    expect(yield* service.openAiEndpoint).toEqual({
+      baseUrl: "http://127.0.0.1:2048/v1",
+      model: "whisper-1",
+    });
+    expect(yield* transcribe()).toBe("hello");
+    const [url, init] = upstream.mock.calls[0]!;
+    expect(String(url)).toBe("http://127.0.0.1:2048/v1/audio/transcriptions");
+    const form = init?.body as FormData;
+    expect(form.get("model")).toBe("whisper-1");
+    expect(form.get("language")).toBe("en");
+    expect(form.get("prompt")).toBe("T3 Code, Effect");
+    expect(form.has("languages[]")).toBe(false);
+    expect(form.has("keywords[]")).toBe(false);
+    expect([...form.keys()].at(-1)).toBe("file");
+    // A key-less save leaves the key, and a model alone keeps OpenAI's URL and field names.
+    yield* service.setKey("openai", undefined, { baseUrl: "", model: "custom-model" });
+    expect((yield* service.configured).openai).toBe(true);
+    yield* transcribe();
+    const [plainUrl, plainInit] = upstream.mock.calls[1]!;
+    expect(String(plainUrl)).toBe("https://api.openai.com/v1/audio/transcriptions");
+    const plain = plainInit?.body as FormData;
+    expect(plain.get("model")).toBe("custom-model");
+    expect(plain.getAll("keywords[]")).toEqual(["T3 Code", "Effect"]);
+    expect(plain.get("languages[]")).toBe("en");
+  }),
+);
+
 it.effect("uploads to OpenRouter only for a listed exact model, as zero-retention JSON WAV", () =>
   Effect.gen(function* () {
     const upstream = vi.fn<typeof fetch>(async (input) =>

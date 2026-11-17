@@ -50,6 +50,7 @@ import {
 } from "./baseSchemas.ts";
 import {
   CloudSpeechApiKey,
+  CloudSpeechEndpoint,
   CloudSpeechError,
   CloudSpeechKeys,
   CloudSpeechModelId,
@@ -803,9 +804,14 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
       headers: OptionalBearerHeaders,
       params: Schema.Struct({ provider: CloudSpeechProvider }),
       payload: Schema.Struct({
-        key: Schema.NullOr(
-          Schema.Union([Schema.RedactedFromValue(CloudSpeechApiKey), SecretReference]),
+        // Omitted to change only the OpenAI endpoint.
+        key: Schema.optionalKey(
+          Schema.NullOr(
+            Schema.Union([Schema.RedactedFromValue(CloudSpeechApiKey), SecretReference]),
+          ),
         ),
+        // Applies to the openai provider only; omitted leaves the endpoint as is.
+        endpoint: Schema.optionalKey(CloudSpeechEndpoint),
       }),
       success: HttpApiSchema.NoContent,
       error: EnvironmentScopedOperationErrors,

@@ -530,3 +530,17 @@ describe("server model preferences", () => {
     expect(decodeServerSettingsPatch(input)).toEqual(input);
   });
 });
+
+describe("cloud speech OpenAI endpoint", () => {
+  it("defaults to empty and accepts only http(s) URLs without credentials", () => {
+    expect(decodeServerSettings({}).cloudSpeechOpenAiEndpoint).toEqual({ baseUrl: "", model: "" });
+    const patch = (baseUrl: string, model = "") =>
+      decodeServerSettingsPatch({ cloudSpeechOpenAiEndpoint: { baseUrl, model } });
+    expect(patch(" http://127.0.0.1:2048/v1 ", "whisper-1")).toEqual({
+      cloudSpeechOpenAiEndpoint: { baseUrl: "http://127.0.0.1:2048/v1", model: "whisper-1" },
+    });
+    for (const bad of ["ftp://x/v1", "localhost:2048", "http://u:p@host/v1", "/v1"])
+      expect(() => patch(bad)).toThrow();
+    expect(() => patch("", "has space")).toThrow();
+  });
+});

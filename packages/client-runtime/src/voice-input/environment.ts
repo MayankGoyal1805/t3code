@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import { CloudSpeechError, SPEECH_STREAM_PATH } from "@t3tools/contracts";
 import type {
   CloudSpeechModelId,
+  CloudSpeechEndpoint,
   CloudSpeechProvider,
   SettingsSecretValue,
   SpeechAcceleration,
@@ -109,7 +110,8 @@ export const requireCloudSpeechKey = (
 export const setCloudSpeechKey = (
   prepared: PreparedConnection,
   provider: CloudSpeechProvider,
-  key: SettingsSecretValue | null,
+  key: SettingsSecretValue | null | undefined,
+  endpoint?: CloudSpeechEndpoint,
 ) =>
   request({
     group: "voice",
@@ -120,7 +122,10 @@ export const setCloudSpeechKey = (
       client.setCloudKey({
         headers,
         params: { provider },
-        payload: { key: typeof key === "string" ? Redacted.make(key) : key },
+        payload: {
+          ...(key === undefined ? {} : { key: typeof key === "string" ? Redacted.make(key) : key }),
+          ...(endpoint ? { endpoint } : {}),
+        },
       }),
   });
 

@@ -36,6 +36,10 @@ subscription is needed. Switch back to **This device** on mobile or **Off** on
 web and desktop to stop sharing. Removing the key stops that provider for everyone
 on the environment.
 
+The **OpenAI** option also accepts an optional **Base URL** and **Model** for an
+OpenAI-compatible server. When a base URL is set, the saved key and your recordings
+are sent to that server instead of OpenAI.
+
 **OpenRouter** works the same way but has no default model: pick one from its live
 speech-to-text catalog when you enable it, or later under **Manage OpenRouter**.
 The model choice is yours alone and needs no settings access, so anyone with
