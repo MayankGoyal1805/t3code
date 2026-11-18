@@ -353,7 +353,7 @@ export function CloudVoiceConfiguration({
               ? `Everyone using ${name} for dictation on ${environment.label} will lose access.`
               : active && !routed
                 ? `Anyone with dictation access to ${environment.label} can use this API key.`
-                : cloudSpeechDisclosure(provider, environment.label)}
+                : cloudSpeechDisclosure(provider, environment.label, savedEndpoint?.baseUrl)}
           </DialogDescription>
         </DialogHeader>
         {!remove && (
